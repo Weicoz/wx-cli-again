@@ -1,0 +1,25 @@
+[
+  {
+    "displayName": "合成完整群",
+    "memberCount": 2,
+    "members": [
+      {
+        "displayName": "合成好友",
+        "wxid": "wxid_contract_friend"
+      },
+      {
+        "displayName": "合成用户",
+        "wxid": "wxid_contract_self"
+      }
+    ],
+    "membersComplete": true,
+    "wxid": "10001@chatroom"
+  },
+  {
+    "displayName": "合成待补群",
+    "memberCount": 0,
+    "members": [],
+    "membersComplete": false,
+    "wxid": "10002@chatroom"
+  }
+]

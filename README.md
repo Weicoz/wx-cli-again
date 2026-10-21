@@ -486,6 +486,33 @@ Windows 管道名为 `wx-cli-<SHA-256(账号配置目录路径)>`，完整路径
 Windows 自动启动 daemon 使用 `CreateProcessW(bInheritHandles=false)`；daemon 在自身进程内打开日志，避免调用方捕获 stdout/stderr 时等待 daemon 关闭句柄。
 
 
+### 契约标准样例（golden）
+
+`tests/fixtures/contract/` 中的样例为契约的一部分，改输出必须同步更新样例并通知操作端。操作端契约测试可以直接读取这些 JSON 文件。
+
+| 文件 | 场景 |
+|---|---|
+| `whoami.json` | 当前合成账号身份 |
+| `groups.json` | 完整群，以及 `membersComplete: false` 的群 |
+| `incremental.json` | 文本、含 `notify@all` 的 mentions、引用发送者有值与 null、无发送者的 10000 系统消息、本人消息、`has_more: true` |
+| `incremental-empty.json` | 已知群尚无消息表，返回空批次 |
+| `error-chat-not-found.json` | 未知会话，退出码 1 |
+| `error-login-required.json` | 合成账号没有数据库占用进程，退出码 1 |
+
+`tests/contract_cli.rs` 在临时目录构造 SQLite 库，运行真实 `wx` 子进程，将 stdout 与对应文件逐字节比较；不一致时报首个差异字节、长度和两份内容。样例不经 JSON 重序列化或字段替换：whoami/groups 保留 CLI 美化格式，incremental/错误保留 CLI 紧凑格式，全部保留末尾 LF。
+
+```bash
+# 验证已入库样例
+cargo test --test contract_cli -- --test-threads=1
+# 有意更新输出契约时，从真实 stdout 重写样例
+UPDATE_CONTRACT_FIXTURES=1 cargo test --test contract_cli -- --test-threads=1
+git diff -- tests/fixtures/contract/
+```
+
+完整生成和验证在 macOS 执行：测试通过 macOS 文件 API 将合成消息库创建时间固定为 Unix 秒 `1700000000`，使包含库代际的 `next_cursor` 也逐字节稳定；不归一化 stdout，不修改产品游标逻辑。其余五项测试可在 Unix 执行；Linux 不执行非空增量 golden 测试，Windows 不执行此测试文件。六份 JSON 均可供各平台消费端读取。
+
+账号、群、消息均为合成数据，消息时间固定；`WX_CLI_HOME` 与替代的 pgrep/lsof 隔离本机账号及进程查询。测试不读真实微信库或密钥，不启动 daemon，结束（含断言失败）后清理本次临时库。
+
 ## 按 ID 游标增量读取（fork 契约，票 03/04）
 
 ```bash
