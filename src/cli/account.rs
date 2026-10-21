@@ -29,7 +29,7 @@ pub fn error_json(error: &anyhow::Error) -> Value {
 }
 
 /// 每次查询直接验证源库与进程占用；不得从 daemon 的旧联系人缓存推断身份。
-fn reader_connection() -> Result<(crate::config::Config, rusqlite::Connection)> {
+pub(crate) fn reader_connection() -> Result<(crate::config::Config, rusqlite::Connection)> {
     let config_path = crate::config::find_config_file()?;
     if !config_path.exists() {
         return Err(reader_error(
@@ -44,11 +44,15 @@ fn reader_connection() -> Result<(crate::config::Config, rusqlite::Connection)> 
 }
 
 fn open_contact(cfg: &crate::config::Config) -> Result<rusqlite::Connection> {
+    open_database(cfg, "contact/contact.db")
+}
+
+pub(crate) fn open_database(cfg: &crate::config::Config, rel: &str) -> Result<rusqlite::Connection> {
     use anyhow::Context;
     use std::io::Read;
-    let path = cfg.db_dir.join("contact/contact.db");
+    let path = cfg.db_dir.join(rel);
     if !path.is_file() {
-        return Err(reader_error("LOGIN_REQUIRED", "目标账号缺少联系人数据库"));
+        return Err(reader_error("LOGIN_REQUIRED", format!("目标账号缺少数据库 {rel}")));
     }
     let mut header = [0u8; 16];
     std::fs::File::open(&path)?.read_exact(&mut header)?;
@@ -61,10 +65,10 @@ fn open_contact(cfg: &crate::config::Config) -> Result<rusqlite::Connection> {
             .map_err(|_| reader_error("KEY_FAILED", "账号密钥文件格式错误"))?;
         let keys = crate::daemon::extract_keys(&keys);
         let key = keys
-            .get("contact/contact.db")
-            .ok_or_else(|| reader_error("KEY_FAILED", "缺少联系人数据库密钥，请重新取钥"))?;
+            .get(rel)
+            .ok_or_else(|| reader_error("KEY_FAILED", format!("缺少 {rel} 密钥，请重新取钥")))?;
         crate::crypto::sqlcipher::open_encrypted_readonly(&path, key)
-            .map_err(|_| reader_error("KEY_FAILED", "联系人数据库密钥不匹配，请重新取钥"))?
+            .map_err(|_| reader_error("KEY_FAILED", format!("{rel} 密钥不匹配，请重新取钥")))?
     };
     conn.execute_batch("PRAGMA query_only=ON")
         .context("设置只读查询失败")?;

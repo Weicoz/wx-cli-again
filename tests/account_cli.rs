@@ -210,6 +210,17 @@ fn captured_cli_returns_while_two_account_daemons_keep_running() {
     let root = std::env::temp_dir().join(format!("wx-daemons-cli-{}", std::process::id()));
     #[cfg(unix)]
     {
+        match Command::new("ps")
+            .args(["-o", "command=", "-p", &std::process::id().to_string()])
+            .output()
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("SKIP daemon IPC integration: sandbox denies ps: {error}");
+                return;
+            }
+            Ok(output) => assert!(output.status.success(), "ps preflight failed: {output:?}"),
+            Err(error) => panic!("ps preflight failed: {error}"),
+        }
         std::fs::create_dir_all(&root).unwrap();
         let probe = root.join("probe.sock");
         match std::os::unix::net::UnixListener::bind(&probe) {
