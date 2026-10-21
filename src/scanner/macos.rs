@@ -124,7 +124,11 @@ pub fn scan_keys_with_options(
     let is_root = unsafe { libc::geteuid() } == 0;
 
     // 1. 查找 WeChat PID
-    let pid = find_wechat_pid().context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
+    let pid = if crate::config::selected_account().is_some() || crate::config::selected_pid()?.is_some() {
+        crate::process::find_for_db(Some(db_dir), crate::config::selected_pid()?)? as libc::pid_t
+    } else {
+        find_wechat_pid().context("找不到 WeChat 进程，请确认 WeChat 正在运行")?
+    };
     eprintln!("WeChat PID: {}", pid);
     let signature = detect_signature(pid);
     match signature {

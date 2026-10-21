@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::json;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use crate::config;
@@ -67,14 +68,15 @@ fn run_checks() -> Vec<Check> {
     let mut out = Vec::new();
 
     // WeChat process
-    let wechat_pid = find_wechat_pid();
+    let process = config::selected_pid().and_then(|pid| {
+        let cfg = config::load_config().ok();
+        crate::process::find_for_db(cfg.as_ref().map(|cfg| cfg.db_dir.as_path()), pid)
+    });
     out.push(Check {
         name: "WeChat 进程".into(),
-        ok: wechat_pid.is_some(),
-        detail: wechat_pid
-            .map(|p| format!("PID {p}"))
-            .unwrap_or_else(|| "未运行".into()),
-        fix: Some("请先登录并保持微信运行".into()),
+        ok: process.is_ok(),
+        detail: process.map(|pid| format!("PID {pid}")).unwrap_or_else(|error| error.to_string()),
+        fix: Some("请先登录目标账号；多账号使用 --wxid / --pid".into()),
     });
 
     // SIP — 非致命；状态仅供参考
@@ -281,11 +283,12 @@ fn run_checks() -> Vec<Check> {
 
     // daemon sock
     let sock = config::sock_path();
+    let daemon_alive = super::transport::is_alive();
     out.push(Check {
         name: "daemon socket".into(),
-        ok: sock.exists(),
-        detail: if sock.exists() {
-            sock.display().to_string()
+        ok: daemon_alive,
+        detail: if daemon_alive {
+            if cfg!(windows) { config::pipe_name() } else { sock.display().to_string() }
         } else {
             "未运行（首次查询会自动启动）".into()
         },
@@ -336,19 +339,6 @@ fn format_missing_preview(items: &[scanner::MissingDb], max: usize) -> String {
     } else {
         parts.join(", ")
     }
-}
-
-fn find_wechat_pid() -> Option<u32> {
-    let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
 }
 
 fn read_key_for(keys_path: &Path, rel: &str) -> Option<String> {

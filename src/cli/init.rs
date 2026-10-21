@@ -9,7 +9,11 @@ use crate::scanner::{self, KeyEntry, ScanOptions};
 pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
     // 查找 config.json
     let config_path = find_or_create_config_path();
+    let _ = config::selected_pid()?;
 
+    if config::selected_account().is_some() && config_path.exists() {
+        config::load_config()?;
+    }
     // 检查是否已初始化
     if !force && config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
@@ -25,6 +29,9 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
                     && Path::new(db_dir).exists()
                     && keys_path.exists()
                 {
+                    if config::selected_account().is_some() {
+                        super::account::verify_configured_identity(&config::load_config()?)?;
+                    }
                     println!("已初始化，数据目录: {}", db_dir);
                     println!("如需重新扫描密钥，使用 --force");
                     // 仍检查磁盘上是否有未收录的分片
@@ -58,6 +65,9 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
 
     // Step 1: 解析 db_dir —— 已有有效配置时优先沿用，避免多账号下 auto-detect 切错库。
     let db_dir = resolve_db_dir(&config_path)?;
+    if let Some(account) = config::selected_account() {
+        anyhow::ensure!(config::account_matches_dir(&account, &db_dir), "db_dir 与 --wxid 不匹配");
+    }
     println!("数据目录: {}", db_dir.display());
 
     // 读取已有密钥（验证仍有效的保留，避免 force 扫描不全时丢 key）
@@ -98,6 +108,13 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
             db_dir.display(),
             config::RECOMMENDED_KEY_EXTRACT
         );
+    }
+
+    if config::selected_account().is_some() {
+        let contact_key = entries.iter().find(|entry| entry.db_name.replace('\\', "/") == "contact/contact.db")
+            .context("无法确认目标账号：未取到 contact/contact.db 密钥，已保留原配置")?;
+        let conn = crate::crypto::sqlcipher::open_encrypted_readonly(&db_dir.join("contact/contact.db"), &contact_key.enc_key)?;
+        super::account::identity(&conn, &db_dir)?;
     }
 
     // === 权限边界 ===
@@ -220,6 +237,9 @@ fn resolve_keys_path(config_path: &Path, keys_file: &str) -> PathBuf {
 /// 多账号场景下，`auto_detect` 按 mtime 选最新目录可能切到闲置号，
 /// 导致 force 提取时已有密钥全部校验失败、用户误以为密钥丢了。
 fn resolve_db_dir(config_path: &Path) -> Result<PathBuf> {
+    if config::selected_account().is_some() && config_path.exists() {
+        return Ok(config::load_config()?.db_dir);
+    }
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(config_path) {
             if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -385,6 +405,9 @@ fn drop_privileges_if_sudo() -> Result<()> {
 }
 
 fn find_or_create_config_path() -> std::path::PathBuf {
+    if config::selected_account().is_some() || std::env::var_os("WX_CLI_HOME").is_some() {
+        return config::cli_dir().join("config.json");
+    }
     // 如果当前工作目录或可执行文件目录已有 config.json，沿用它（支持便携模式）
     if let Ok(cwd) = std::env::current_dir() {
         let p = cwd.join("config.json");

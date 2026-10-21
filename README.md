@@ -428,3 +428,50 @@ macOS 取钥依赖本机 Terminal 的 `task_for_pid` / 调试能力，**与是�
 ## 免责声明
 
 本工具仅用于学习和研究目的，用于解密**自己的**微信数据。请遵守相关法律法规，不得用于未经授权的数据访问。
+
+## 多账号、身份与群列表（fork 契约）
+
+同机多账号，每次调用传 `--wxid <账号原始 wxid>`。可选 `--pid <主进程 PID>`；PID 必须属于该账号数据库的占用主进程，不能指向 `--type=` 辅助进程。Windows 用 CIM 查询命令行、Restart Manager 只读查询数据库占用；不调用关闭或重启应用的 API。macOS/Linux 的显式账号选择使用 `pgrep` 和 `lsof`。
+
+```bash
+wx --wxid wxid_example init
+wx --wxid wxid_example --pid 1234 key extract
+wx --wxid wxid_example whoami --json
+wx --wxid wxid_example groups --json
+wx --wxid wxid_example doctor --json
+```
+
+账号目录为 `~/.wx-cli/accounts/<SHA-256(wxid)>/`，含 `config.json`、`all_keys.json`、`cache/`、`decrypted/`、`last_check.json`、`watch_state.json`、`shard-meta.json`、daemon PID 和日志。哈希保留账号大小写差异，避免 Windows 目录串号。`WX_CLI_HOME` 可指定 `.wx-cli` 根目录；`WX_ACCOUNT`、`WX_PID` 为参数的环境变量等价入口，CLI 参数优先。
+
+指定账号时，不回退到工作目录、可执行文件目录或旧的共用配置；密钥与解密目录必须留在该账号目录。`db_dir` 必须对应 `<wxid>/db_storage` 或 `<wxid>_<4位十六进制后缀>/db_storage`。首次 `init` 仅在该账号目录中自动检测；无法检测时，在账号 `config.json` 中填写准确的 `db_dir` 后再取钥。旧的共用配置不会自动迁移。
+
+Windows 管道名为 `wx-cli-<SHA-256(账号配置目录路径)>`，完整路径加 `\\.\pipe\` 前缀。server、client、ping 共用同一映射。Unix 显式账号 socket 位于临时目录，以配置目录哈希命名，避免路径过长。无账号参数时保留旧配置查找；升级前停止旧版 daemon，避免版本混用。
+
+`whoami --json` 成功（stdout，退出码 0），字段与暂定契约一致：
+
+```json
+{"wxid":"wxid_example","displayName":"本人昵称"}
+```
+
+`groups --json` 成功（stdout 数组，退出码 0）：
+
+```json
+[{"wxid":"123@chatroom","displayName":"客服群","memberCount":2,"members":[{"wxid":"wxid_a","displayName":"群昵称甲"},{"wxid":"wxid_b","displayName":"联系人乙"}]}]
+```
+
+群按 wxid 排序，成员按 wxid 排序。成员显示名依次取群昵称、联系人备注、联系人昵称、wxid。只从联系人与群成员表读取完整成员；不扫描消息、不以发言者推算成员数。成员结构不支持或群记录缺失时返回错误，不报告不完整列表。空群返回 `memberCount: 0`、`members: []`；无群返回 `[]`。
+
+两条命令每次直接核对数据库占用与本人联系人，随后只读打开源库，不使用旧 daemon 缓存推断当前登录身份。联系人表必须包含本人，且账号目录必须能唯一匹配本人 wxid。无法确认则失败。明文 SQLite 可直接只读查询，加密库使用该账号已有密钥；两条命令均不会自动扫描进程内存取钥。
+
+两条命令失败时退出码 1，stdout 固定结构：
+
+```json
+{"error":{"code":"LOGIN_REQUIRED","message":"错误说明"}}
+```
+
+- `LOGIN_REQUIRED`：未初始化、缺数据库、目标账号无占用数据库的主进程。
+- `KEY_FAILED`：缺少密钥、密钥文件损坏或密钥不匹配。
+- `VERSION_UNSUPPORTED`：联系人/群结构不支持，或无法唯一确认本人。
+- `INTERNAL`：配置不匹配、系统查询失败、多主进程歧义或其他内部错误。
+
+Windows 自动启动 daemon 使用 `CreateProcessW(bInheritHandles=false)`；daemon 在自身进程内打开日志，避免调用方捕获 stdout/stderr 时等待 daemon 关闭句柄。

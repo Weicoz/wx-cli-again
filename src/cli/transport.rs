@@ -36,6 +36,9 @@ pub fn is_alive() -> bool {
 
 /// 确保 daemon 运行，必要时自动启动
 pub fn ensure_daemon() -> Result<()> {
+    if config::selected_account().is_some() {
+        super::account::verify_configured_identity(&config::load_config()?)?;
+    }
     if is_alive() {
         return Ok(());
     }
@@ -153,27 +156,7 @@ fn start_daemon() -> Result<()> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let log_path = config::log_path();
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let (stdout_stdio, stderr_stdio) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|f| f.try_clone().map(|g| (f, g)))
-            .map(|(f, g)| (std::process::Stdio::from(f), std::process::Stdio::from(g)))
-            .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()));
-        let child = std::process::Command::new(&exe)
-            .env("WX_DAEMON_MODE", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(stdout_stdio)
-            .stderr(stderr_stdio)
-            .creation_flags(0x00000008) // DETACHED_PROCESS
-            .spawn()
-            .context("无法启动 daemon 进程")?;
-        child_pid = child.id();
+        child_pid = spawn_windows_daemon(&exe)?;
     }
 
     // 等待 daemon 就绪（最多 STARTUP_TIMEOUT_SECS 秒）
@@ -191,6 +174,37 @@ fn start_daemon() -> Result<()> {
         STARTUP_TIMEOUT_SECS,
         config::log_path().display()
     )
+}
+
+/// CreateProcessW 明确禁用句柄继承；标准 Command 的重定向不保证关闭其他可继承 pipe 句柄。
+#[cfg(windows)]
+fn spawn_windows_daemon(exe: &Path) -> Result<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{CreateProcessW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW};
+    let application: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut command: Vec<u16> = std::ffi::OsString::from(format!("\"{}\"", exe.display())).encode_wide().chain(Some(0)).collect();
+    let mut vars: Vec<_> = std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case("WX_DAEMON_MODE")).collect();
+    vars.push(("WX_DAEMON_MODE".into(), "1".into()));
+    vars.sort_by_key(|(key, _)| key.to_string_lossy().to_ascii_uppercase());
+    let mut environment = Vec::new();
+    for (mut key, value) in vars {
+        key.push("="); key.push(value);
+        environment.extend(key.encode_wide()); environment.push(0);
+    }
+    environment.push(0);
+    let startup = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut process = PROCESS_INFORMATION::default();
+    // 不传 STARTF_USESTDHANDLES，日志在 daemon 内自行打开；父进程管道不会留在子进程中。
+    unsafe {
+        CreateProcessW(PCWSTR(application.as_ptr()), PWSTR(command.as_mut_ptr()), None, None, false,
+            DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT, Some(environment.as_ptr().cast()),
+            PCWSTR::null(), &startup, &mut process).context("无法启动 daemon 进程")?;
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
+    }
+    Ok(process.dwProcessId)
 }
 
 fn write_pid_file(pid: u32, exe: &Path) -> Result<()> {
@@ -257,7 +271,7 @@ fn ping_unix() -> Result<bool> {
 fn ping_windows() -> Result<bool> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
 
-    let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
+    let name = config::pipe_name().to_ns_name::<GenericNamespaced>()?;
     let stream = Stream::connect(name)?;
     let mut reader = BufReader::new(stream);
 
@@ -468,7 +482,7 @@ fn send_unix(req: Request) -> Result<Response> {
 fn send_windows(req: Request) -> Result<Response> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
 
-    let name = "wx-cli-daemon"
+    let name = config::pipe_name()
         .to_ns_name::<GenericNamespaced>()
         .context("构造 pipe name 失败")?;
     let stream = Stream::connect(name).context("连接 daemon named pipe 失败")?;

@@ -85,12 +85,12 @@ async fn serve_windows(
     use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions};
 
     // interprocess 的 GenericNamespaced 在 Windows 上会自动拼接 `\\.\pipe\` 前缀，
-    // 这里必须传相对名；client 端用 `\\.\pipe\wx-cli-daemon` 直接打开可以对上
-    let name = "wx-cli-daemon".to_ns_name::<GenericNamespaced>()?;
+    // server/client/ping 共用按用户目录与账号计算的相对名。
+    let name = crate::config::pipe_name().to_ns_name::<GenericNamespaced>()?;
     let opts = ListenerOptions::new().name(name);
     let listener = opts.create_tokio()?;
 
-    eprintln!("[server] 监听 \\\\.\\pipe\\wx-cli-daemon");
+    eprintln!("[server] 监听 {}", crate::config::pipe_name());
 
     loop {
         let conn = listener.accept().await?;
