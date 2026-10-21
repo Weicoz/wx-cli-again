@@ -202,6 +202,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// 按 local_id 游标增量读取群消息（固定 JSON）
+    Incremental {
+        /// 精确群 wxid（如 123@chatroom）
+        chat: String,
+        /// 不透明游标；空字符串为首次，省略则从账号内检查点续读
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(short = 'n', long, default_value = "200", value_parser = clap::value_parser!(u32).range(1..=10000))]
+        limit: u32,
+    },
     /// 聊天统计分析
     Stats {
         /// 聊天对象名称（支持模糊匹配）
@@ -460,7 +470,7 @@ pub enum DaemonCommands {
 
 pub fn run() {
     let cli = Cli::parse();
-    let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true });
+    let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true } | Commands::Incremental { .. });
     if let Err(e) = dispatch(cli) {
         if contract_json {
             println!("{}", account::error_json(&e));
@@ -478,6 +488,18 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Whoami { json } => account::cmd_whoami(json),
         Commands::Groups { json } => account::cmd_groups(json),
+        Commands::Incremental { chat, cursor, limit } => {
+            if crate::config::selected_account().is_none() {
+                return Err(account::reader_error("ACCOUNT_REQUIRED", "incremental 必须用 --wxid 选择账号"));
+            }
+            let (cfg, conn) = account::reader_connection()?;
+            let identity = account::identity(&conn, &cfg.db_dir)?;
+            let wxid = identity["wxid"].as_str().ok_or_else(|| account::reader_error("INTERNAL", "账号身份缺少 wxid"))?;
+            let response = crate::incremental::poll(&cfg, wxid, &chat, cursor.as_deref(), limit as usize,
+                &crate::config::cli_dir().join("incremental.db"))?;
+            println!("{}", serde_json::to_string(&response)?);
+            Ok(())
+        },
         Commands::Init {
             force,
             hook_seconds,

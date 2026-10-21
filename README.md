@@ -475,3 +475,64 @@ Windows 管道名为 `wx-cli-<SHA-256(账号配置目录路径)>`，完整路径
 - `INTERNAL`：配置不匹配、系统查询失败、多主进程歧义或其他内部错误。
 
 Windows 自动启动 daemon 使用 `CreateProcessW(bInheritHandles=false)`；daemon 在自身进程内打开日志，避免调用方捕获 stdout/stderr 时等待 daemon 关闭句柄。
+
+
+## 按 ID 游标增量读取（fork 契约，票 03）
+
+```bash
+# 首次：空游标，从该会话各分片的首个 local_id 开始
+wx --wxid wxid_example --pid 1234 incremental '123@chatroom' --cursor '' --limit 200
+# 下一批：原样传回 next_cursor；不要解码或修改
+wx --wxid wxid_example incremental '123@chatroom' --cursor '<next_cursor>' --limit 200
+# 省略 --cursor：从该账号、该会话的持久化检查点续读
+wx --wxid wxid_example incremental '123@chatroom' --limit 200
+```
+
+固定输出 JSON，无需 `--json`。必须用 `--wxid` 或 `WX_ACCOUNT` 选择账号；可用 `--pid` / `WX_PID` 指定主进程。每次复用 whoami 的进程占用与本人身份检查，直接只读打开源库及 WAL，不依赖 daemon、不扫描进程内存、不自动取钥。会话参数为精确群 wxid，不支持昵称模糊匹配。`--limit` 默认 200，范围 1–10000。
+
+成功：退出码 0，stdout 为单个对象：
+
+```json
+{
+  "account_wxid": "wxid_example",
+  "chat_wxid": "123@chatroom",
+  "messages": [{
+    "server_id": "9007199254740993",
+    "svrid": "9007199254740993",
+    "local_id": 42,
+    "shard": "message/message_0.db",
+    "chat_wxid": "123@chatroom",
+    "sender_wxid": "wxid_sender",
+    "is_self": false,
+    "timestamp": 1792454400,
+    "type": 1,
+    "text": "消息正文"
+  }],
+  "next_cursor": "<opaque-token>",
+  "has_more": false
+}
+```
+
+`server_id` 与 `svrid` 为相同的十进制字符串，避免 JavaScript 丢失 64 位精度。`local_id` 为分片、会话表内自增 ID；`type` 为 local_type 低 32 位数值，`timestamp` 为 Unix 秒。`text` 为 TEXT/BLOB 解码及 WCDB zstd 解压后的正文，移除已识别的群发送者前缀；XML 保留原文，本票不新增 @ 或引用字段。发送者先取该分片 Name2Id，缺失时取群正文前缀；无法确认时 `sender_wxid` 与 `is_self` 为 null，不猜本人。server_id 未分配（0/null）时返回 MESSAGE_NOT_READY，且不推进，等待入库完成后重试。
+
+按分片相对路径字典序、各表 local_id 升序分页；不保证跨分片发送时间顺序。晚到消息、同秒消息均按入库 ID 读取。游标包含版本、账号、会话表、各分片代际与已读 ID。每次从磁盘发现新 message_N.db；新分片从首行读起，不依赖旧密钥索引。任一分片缺钥、查询失败均整体失败，不交付残缺批次。已有分片或表消失、代际锚点改变时报 DB_ROTATED；不会清空游标或自动从头读。
+
+状态位于该账号目录 `incremental.db`，与旧 `new-messages` 的时间戳状态独立。SQLite 事务保存检查点与全部批次，避免 Windows 覆盖 rename 的空窗。显式 `--cursor` 不推进隐式检查点；省略参数才保存并推进检查点。既有状态库缺初始化版本、缺表、截空或内容损坏均返回错误，不回退为空。全部批次按输入游标和 limit 持久化，重放返回相同消息、新游标及 has_more，后续插入不改变已返回批次。每次新读取增加游标序列；空批次也必须回传新的 next_cursor 才能继续探测新增消息。重放仍核对当前账号、源库代际与边界，失效时返回错误。固定 limit 使用同一游标链。首次空游标重放也遵守上述规则。
+
+操作端必须自行持久化收到的 next_cursor，并在失败时重传原输入游标。隐式检查点仅提供进程重启续读，不代表下游确认；若调用方丢失 stdout，需用上次显式游标恢复。批次记录含正文，只保存在本账号状态库（Unix 文件权限 0600，Windows 继承账号目录 ACL）；空批次也占状态空间，随轮询累计增长，保留它才能跨进程重放。
+
+失败：退出码 1，stdout 为 `{"error":{"code":"...","message":"..."}}`。
+
+| code | 条件 |
+|---|---|
+| ACCOUNT_REQUIRED | 未显式选择账号 |
+| CURSOR_INVALID | 游标格式、版本或字段非法 |
+| CURSOR_ACCOUNT_MISMATCH | 游标属于其他账号 |
+| CURSOR_CHAT_MISMATCH | 游标属于其他会话 |
+| CURSOR_OUT_OF_RANGE | 已读 ID 越界或边界记录消失 |
+| DB_ROTATED | 已有分片/表消失、源库代际或边界 server_id 改变 |
+| CHAT_NOT_FOUND | 首次读取时各分片均无该会话表 |
+| MESSAGE_NOT_READY | server_id 尚未分配 |
+| LOGIN_REQUIRED / KEY_FAILED / VERSION_UNSUPPORTED / INTERNAL | 沿用票 02；结构不支持或正文损坏也返回 VERSION_UNSUPPORTED |
+
+参数语法错误由 clap 输出 stderr、退出码 2；执行期错误按上表输出 JSON。不能延续时保留原状态，由操作端报错并人工核实源库后恢复。
