@@ -531,6 +531,8 @@ wx --wxid wxid_example incremental '123@chatroom' --limit 200
 
 按分片相对路径字典序、各表 local_id 升序分页；不保证跨分片发送时间顺序。晚到消息、同秒消息均按入库 ID 读取。游标包含版本、账号、会话表、各分片代际与已读 ID。每次从磁盘发现新 message_N.db；新分片从首行读起，不依赖旧密钥索引。任一分片缺钥、查询失败均整体失败，不交付残缺批次。已有分片或表消失、代际锚点改变时报 DB_ROTATED；不会清空游标或自动从头读。
 
+联系人表中存在的精确群 wxid（`@chatroom`），在所有消息分片均无该群会话表时返回空批次：`messages: []`、`has_more: false`；首次尚无消息目录或分片也遵守此规则。空批次照常保存并生成新的 `next_cursor`，同一输入游标与 limit 稳定重放原批次。继续传回 `next_cursor` 后，新出现的会话表或分片从首个 local_id 读取，不漏读、不重复交付已推进的消息。联系人中也不存在的会话仍返回 CHAT_NOT_FOUND；已有分片或表消失仍返回 DB_ROTATED。
+
 状态位于该账号目录 `incremental.db`，与旧 `new-messages` 的时间戳状态独立。SQLite 事务保存检查点与全部批次，避免 Windows 覆盖 rename 的空窗。显式 `--cursor` 不推进隐式检查点；省略参数才保存并推进检查点。既有状态库缺初始化版本、缺表、截空或内容损坏均返回错误，不回退为空。全部批次按输入游标和 limit 持久化，重放返回相同消息、新游标及 has_more，后续插入不改变已返回批次。每次新读取增加游标序列；空批次也必须回传新的 next_cursor 才能继续探测新增消息。重放仍核对当前账号、源库代际与边界，失效时返回错误。固定 limit 使用同一游标链。首次空游标重放也遵守上述规则。
 
 操作端必须自行持久化收到的 next_cursor，并在失败时重传原输入游标。隐式检查点仅提供进程重启续读，不代表下游确认；若调用方丢失 stdout，需用上次显式游标恢复。批次记录含正文，只保存在本账号状态库（Unix 文件权限 0600，Windows 继承账号目录 ACL）；空批次也占状态空间，随轮询累计增长，保留它才能跨进程重放。
@@ -545,7 +547,7 @@ wx --wxid wxid_example incremental '123@chatroom' --limit 200
 | CURSOR_CHAT_MISMATCH | 游标属于其他会话 |
 | CURSOR_OUT_OF_RANGE | 已读 ID 越界或边界记录消失 |
 | DB_ROTATED | 已有分片/表消失、源库代际或边界 server_id 改变 |
-| CHAT_NOT_FOUND | 首次读取时各分片均无该会话表 |
+| CHAT_NOT_FOUND | 各分片均无该会话表，且联系人中不存在该精确群 wxid |
 | MESSAGE_NOT_READY | server_id 尚未分配 |
 | LOGIN_REQUIRED / KEY_FAILED / VERSION_UNSUPPORTED / INTERNAL | 沿用票 02；结构不支持或正文损坏也返回 VERSION_UNSUPPORTED |
 

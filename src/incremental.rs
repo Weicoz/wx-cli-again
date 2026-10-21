@@ -101,17 +101,16 @@ fn generation(path: &Path) -> Result<String> {
 fn open_shards(cfg: &crate::config::Config, cursor: &Cursor) -> Result<BTreeMap<String, Shard>> {
     let mut shards = BTreeMap::new();
     let entries = match std::fs::read_dir(cfg.db_dir.join("message")) {
-        Ok(entries) => entries,
+        Ok(entries) => Some(entries),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(if cursor.shards.is_empty() {
-                reader_error("CHAT_NOT_FOUND", "账号没有消息分片")
-            } else {
-                reader_error("DB_ROTATED", "游标中的消息目录已消失")
-            });
+            if !cursor.shards.is_empty() {
+                return Err(reader_error("DB_ROTATED", "游标中的消息目录已消失"));
+            }
+            None
         }
         Err(error) => return Err(error.into()),
     };
-    for entry in entries {
+    for entry in entries.into_iter().flatten() {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(number) = name
@@ -167,7 +166,9 @@ fn open_shards(cfg: &crate::config::Config, cursor: &Cursor) -> Result<BTreeMap<
     if cursor.shards.keys().any(|key| !shards.contains_key(key)) {
         return Err(reader_error("DB_ROTATED", "游标中的分片已消失"));
     }
-    if !shards.values().any(|s| s.position.has_table) {
+    if !shards.values().any(|s| s.position.has_table)
+        && !crate::cli::account::is_known_group(cfg, &cursor.chat)?
+    {
         return Err(reader_error("CHAT_NOT_FOUND", "各消息分片均无该会话表"));
     }
     Ok(shards)
@@ -550,6 +551,11 @@ mod tests {
                 wechat_process: String::new(),
             };
             std::fs::create_dir_all(cfg.db_dir.join("message")).unwrap();
+            std::fs::create_dir_all(cfg.db_dir.join("contact")).unwrap();
+            Connection::open(cfg.db_dir.join("contact/contact.db"))
+                .unwrap()
+                .execute_batch("CREATE TABLE contact(username TEXT)")
+                .unwrap();
             Self { root, cfg }
         }
 
