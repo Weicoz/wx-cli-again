@@ -89,6 +89,19 @@ fn schema_error(error: rusqlite::Error) -> anyhow::Error {
     }
 }
 
+pub(crate) fn is_known_group(cfg: &crate::config::Config, chat: &str) -> Result<bool> {
+    if !chat.ends_with("@chatroom") {
+        return Ok(false);
+    }
+    open_contact(cfg)?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM contact WHERE username=?1)",
+            [chat],
+            |row| row.get(0),
+        )
+        .map_err(schema_error)
+}
+
 pub(crate) fn identity(conn: &rusqlite::Connection, db_dir: &std::path::Path) -> Result<Value> {
     let mut stmt = conn
         .prepare("SELECT username, nick_name FROM contact")
