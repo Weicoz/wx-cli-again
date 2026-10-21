@@ -207,6 +207,108 @@ fn validate_position(
     Ok(())
 }
 
+fn decoded_text(row: &rusqlite::Row<'_>, column: usize, compression: usize) -> Option<String> {
+    let bytes = match row.get_ref(column).ok()? {
+        rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => bytes,
+        _ => return None,
+    };
+    let bytes = if row.get::<_, Option<i64>>(compression).ok()?.unwrap_or(0) == 4 {
+        zstd::decode_all(bytes).ok()?
+    } else {
+        bytes.to_vec()
+    };
+    String::from_utf8(bytes).ok()
+}
+
+fn mentions(source: Option<&str>) -> Vec<String> {
+    let Some(doc) = source.and_then(|xml| roxmltree::Document::parse(xml).ok()) else {
+        return Vec::new();
+    };
+    let root = doc.root_element();
+    if !root.has_tag_name("msgsource") {
+        return Vec::new();
+    }
+    root.children()
+        .find(|node| node.has_tag_name("atuserlist"))
+        .and_then(|node| node.text())
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn quote(text: &str) -> Option<Value> {
+    let doc = roxmltree::Document::parse(text).ok()?;
+    let root = doc.root_element();
+    let appmsg = if root.has_tag_name("appmsg") {
+        root
+    } else if root.has_tag_name("msg") {
+        root.children().find(|node| node.has_tag_name("appmsg"))?
+    } else {
+        return None;
+    };
+    if appmsg
+        .children()
+        .find(|node| node.has_tag_name("type"))?
+        .text()?
+        .trim()
+        != "57"
+    {
+        return None;
+    }
+    let refer = appmsg
+        .children()
+        .find(|node| node.has_tag_name("refermsg"))?;
+    let field = |tag| {
+        refer
+            .children()
+            .find(|node| node.has_tag_name(tag))
+            .and_then(|node| node.text())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let message_id = field("svrid").filter(|id| {
+        id.bytes().all(|b| b.is_ascii_digit()) && id.parse::<u64>().is_ok_and(|id| id > 0)
+    });
+    Some(json!({"message_id":message_id,"sender_wxid":field("chatusr")}))
+}
+
+fn message_sender(mapped: Option<String>, content: &str, chat: &str) -> Option<String> {
+    mapped
+        .filter(|id| !id.is_empty() && id != chat)
+        .or_else(|| content.split_once(":\n").map(|(id, _)| id.to_owned()))
+}
+
+fn quote_sender(
+    shards: &BTreeMap<String, Shard>,
+    table: &str,
+    chat: &str,
+    server_id: &str,
+) -> Result<Option<String>> {
+    let sql = format!("SELECT n.user_name,m.message_content,m.WCDB_CT_message_content FROM [{table}] m LEFT JOIN Name2Id n ON n.rowid=m.real_sender_id WHERE m.server_id=?1 LIMIT 1");
+    for shard in shards.values().filter(|shard| shard.position.has_table) {
+        let sender = shard
+            .conn
+            .query_row(&sql, [server_id], |row| {
+                let content = decoded_text(row, 1, 2);
+                Ok(message_sender(
+                    row.get::<_, Option<String>>(0).ok().flatten(),
+                    content.as_deref().unwrap_or(""),
+                    chat,
+                ))
+            })
+            .optional()
+            .map_err(schema_error)?
+            .flatten();
+        if sender.is_some() {
+            return Ok(sender);
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn poll(
     cfg: &crate::config::Config,
     account: &str,
@@ -269,7 +371,16 @@ pub(crate) fn poll(
         if !shard.position.has_table {
             continue;
         }
-        let mut stmt = shard.conn.prepare(&format!("SELECT m.local_id, CAST(m.server_id AS TEXT), m.local_type, m.create_time, m.message_content, m.WCDB_CT_message_content, n.user_name FROM [{}] m LEFT JOIN Name2Id n ON n.rowid=m.real_sender_id WHERE m.local_id>?1 ORDER BY m.local_id LIMIT ?2",cursor.table)).map_err(schema_error)?;
+        let (has_source, has_compression): (bool, bool) = shard.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='source'), EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='WCDB_CT_source')",
+            [&cursor.table], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let source = if has_source { "m.source" } else { "NULL" };
+        let compression = if has_compression {
+            "m.WCDB_CT_source"
+        } else {
+            "0"
+        };
+        let mut stmt = shard.conn.prepare(&format!("SELECT m.local_id, CAST(m.server_id AS TEXT), m.local_type, m.create_time, m.message_content, m.WCDB_CT_message_content, n.user_name, {source}, {compression} FROM [{}] m LEFT JOIN Name2Id n ON n.rowid=m.real_sender_id WHERE m.local_id>?1 ORDER BY m.local_id LIMIT ?2",cursor.table)).map_err(schema_error)?;
         let mut rows = stmt.query(rusqlite::params![
             shard.position.local_id,
             (limit - messages.len() + 1) as i64
@@ -303,17 +414,29 @@ pub(crate) fn poll(
             };
             let content = String::from_utf8(content)
                 .map_err(|_| reader_error("VERSION_UNSUPPORTED", "消息正文不是 UTF-8"))?;
-            let sender = row
-                .get::<_, Option<String>>(6)?
-                .filter(|s| !s.is_empty() && s != chat)
-                .or_else(|| content.split_once(":\n").map(|(id, _)| id.to_owned()));
+            let sender = message_sender(row.get(6)?, &content, chat);
             let text = sender
                 .as_ref()
                 .and_then(|id| content.strip_prefix(&format!("{id}:\n")))
                 .unwrap_or(&content);
-            messages.push(json!({"server_id":server_id,"svrid":server_id,"local_id":local_id,"shard":rel,"chat_wxid":chat,"sender_wxid":sender,"is_self":sender.as_ref().map(|s|s==account),"timestamp":timestamp,"type":crate::daemon::query::type_code(local_type),"text":text}));
+            let source = decoded_text(row, 7, 8);
+            let quote = if crate::daemon::query::type_code(local_type) == 49 {
+                quote(text)
+            } else {
+                None
+            };
+            messages.push(json!({"server_id":server_id,"svrid":server_id,"local_id":local_id,"shard":rel,"chat_wxid":chat,"sender_wxid":sender,"is_self":sender.as_ref().map(|s|s==account),"timestamp":timestamp,"type":crate::daemon::query::type_code(local_type),"text":text,"mentions":mentions(source.as_deref()),"quote":quote,"raw":{"message_content":content,"source":source}}));
             shard.position.local_id = local_id;
             shard.position.server_id = Some(server_id);
+        }
+    }
+    for message in &mut messages {
+        if message["quote"].is_object() && message["quote"]["sender_wxid"].is_null() {
+            let sender = match message["quote"]["message_id"].as_str() {
+                Some(id) => quote_sender(&shards, &cursor.table, chat, id)?,
+                None => None,
+            };
+            message["quote"]["sender_wxid"] = json!(sender);
         }
     }
     verify_generations(cfg, &shards)?;
@@ -464,6 +587,261 @@ mod tests {
     }
 
     #[test]
+    fn mentions_and_raw_preserve_wcdb_source_without_using_display_names() {
+        let fixture = Fixture::new();
+        let conn = fixture.shard(0);
+        let table = format!("Msg_{:x}", md5::compute(CHAT));
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN source; ALTER TABLE {table} ADD COLUMN WCDB_CT_source INTEGER"
+        )).unwrap();
+        let sources = [
+            ("<msgsource><atuserlist>wxid_service</atuserlist></msgsource>", false, json!(["wxid_service"])),
+            ("<msgsource><atuserlist><![CDATA[wxid_service, wxid_friend,,]]></atuserlist></msgsource>", true, json!(["wxid_service", "wxid_friend"])),
+            ("<msgsource><atuserlist><![CDATA[notify@all]]></atuserlist></msgsource>", true, json!(["notify@all"])),
+            ("<msgsource/>", false, json!([])),
+            ("<msgsource><atuserlist>wxid_service</msgsource>", false, json!([])),
+        ];
+        for (index, (source, compressed, _)) in sources.iter().enumerate() {
+            Fixture::insert(
+                &conn,
+                101 + index as i64,
+                100,
+                2,
+                "wxid_friend:\n@客服 原始正文",
+            );
+            let bytes = if *compressed {
+                zstd::encode_all(source.as_bytes(), 1).unwrap()
+            } else {
+                source.as_bytes().to_vec()
+            };
+            conn.execute(
+                &format!("UPDATE {table} SET source=?1, WCDB_CT_source=?2 WHERE server_id=?3"),
+                rusqlite::params![bytes, if *compressed { 4 } else { 0 }, 101 + index as i64],
+            )
+            .unwrap();
+        }
+        Fixture::insert(&conn, 106, 100, 2, "无 source");
+        let page = fixture.read(Some(""), 10).unwrap();
+        for (message, (source, _, mentions)) in
+            page["messages"].as_array().unwrap().iter().zip(sources)
+        {
+            assert_eq!(message["mentions"], mentions);
+            assert_eq!(
+                message["raw"],
+                json!({"message_content":"wxid_friend:\n@客服 原始正文", "source":source})
+            );
+            assert_eq!(message["quote"], Value::Null);
+            assert_eq!(message["text"], "@客服 原始正文");
+        }
+        assert_eq!(page["messages"][5]["mentions"], json!([]));
+        assert_eq!(
+            page["messages"][5]["raw"],
+            json!({"message_content":"无 source", "source":null})
+        );
+        assert_eq!(fixture.read(Some(""), 10).unwrap(), page);
+    }
+
+    #[test]
+    fn quote_json_uses_chatusr_and_preserves_ids_without_parsing_display_names() {
+        let fixture = Fixture::new();
+        let conn = fixture.shard(0);
+        let cases = [
+            (244813135921_i64, "<msg><appmsg><type>57</type><refermsg><svrid>9007199254740993</svrid><chatusr><![CDATA[wxid_service]]></chatusr><fromusr>wxid_wrong</fromusr></refermsg></appmsg></msg>", json!({"message_id":"9007199254740993","sender_wxid":"wxid_service"})),
+            (49, "<appmsg><type>57</type><refermsg><svrid>102</svrid><chatusr>wxid_friend</chatusr><displayname>客服</displayname></refermsg></appmsg>", json!({"message_id":"102","sender_wxid":"wxid_friend"})),
+            (49, "<msg><appmsg><type>57</type><refermsg><chatusr>wxid_service</chatusr></refermsg></appmsg></msg>", json!({"message_id":null,"sender_wxid":"wxid_service"})),
+            (49, "<msg><appmsg><type>57</type><refermsg><svrid>invalid</svrid><chatusr>wxid_service</chatusr></refermsg></appmsg></msg>", json!({"message_id":null,"sender_wxid":"wxid_service"})),
+            (49, "<msg><appmsg><type>5</type><refermsg><svrid>101</svrid><chatusr>wxid_service</chatusr></refermsg></appmsg></msg>", Value::Null),
+            (49, "<msg><appmsg><type>57</type></appmsg></msg>", Value::Null),
+            (49, "<msg><appmsg><type>57</type><refermsg>", Value::Null),
+            (1, "<msg><appmsg><type>57</type><refermsg><svrid>101</svrid><chatusr>wxid_service</chatusr></refermsg></appmsg></msg>", Value::Null),
+        ];
+        for (index, (local_type, xml, _)) in cases.iter().enumerate() {
+            let content = format!("wxid_friend:\n{xml}");
+            Fixture::insert(&conn, 201 + index as i64, 100, 2, &content);
+            let bytes = if index == 0 {
+                zstd::encode_all(content.as_bytes(), 1).unwrap()
+            } else {
+                content.into_bytes()
+            };
+            conn.execute(&format!("UPDATE Msg_{:x} SET local_type=?1,message_content=?2,WCDB_CT_message_content=?3 WHERE server_id=?4", md5::compute(CHAT)), rusqlite::params![local_type,bytes,if index == 0 {4} else {0},201 + index as i64]).unwrap();
+        }
+        let page = fixture.read(Some(""), 20).unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), cases.len());
+        for (message, (_, xml, quote)) in page["messages"].as_array().unwrap().iter().zip(cases) {
+            assert_eq!(message["quote"], quote, "{xml}");
+            assert_eq!(
+                message["raw"]["message_content"],
+                format!("wxid_friend:\n{xml}")
+            );
+            assert_eq!(message["mentions"], json!([]));
+        }
+    }
+
+    #[test]
+    fn quote_sender_lookup_spans_shards_and_cursor_boundaries_without_guessing() {
+        let fixture = Fixture::new();
+        let conn = fixture.shard(0);
+        let later = fixture.shard(1);
+        Fixture::insert(&conn, 101, 100, 1, "我方旧消息");
+        Fixture::insert(&conn, 102, 100, 99, "placeholder");
+        conn.execute(&format!("UPDATE Msg_{:x} SET message_content=?1,WCDB_CT_message_content=4 WHERE server_id=102", md5::compute(CHAT)), [zstd::encode_all("wxid_prefix:\n旧消息".as_bytes(), 1).unwrap()]).unwrap();
+        Fixture::insert(&later, 501, 100, 2, "另一分片原消息");
+        let other_table = format!("Msg_{:x}", md5::compute("456@chatroom"));
+        later.execute_batch(&format!("CREATE TABLE {other_table} AS SELECT * FROM Msg_{:x}; UPDATE {other_table} SET server_id=601", md5::compute(CHAT))).unwrap();
+        for (server, referred, chatusr) in [
+            (201, 101, ""),
+            (202, 501, "<chatusr><![CDATA[ ]]></chatusr>"),
+            (203, 102, ""),
+            (204, 999999, ""),
+            (205, 601, ""),
+            (206, 101, "<chatusr>wxid_service</chatusr>"),
+        ] {
+            let xml = format!("<msg><appmsg><type>57</type><refermsg><svrid>{referred}</svrid>{chatusr}<fromusr>wxid_wrong</fromusr><displayname>客服</displayname></refermsg></appmsg></msg>");
+            Fixture::insert(&conn, server, 100, 2, &xml);
+        }
+        conn.execute_batch(&format!(
+            "UPDATE Msg_{:x} SET local_type=49 WHERE server_id>=201",
+            md5::compute(CHAT)
+        ))
+        .unwrap();
+        let old = fixture.read(Some(""), 2).unwrap();
+        let first = fixture.read(old["next_cursor"].as_str(), 2).unwrap();
+        assert_eq!(
+            first["messages"][0]["quote"],
+            json!({"message_id":"101","sender_wxid":ACCOUNT})
+        );
+        assert_eq!(
+            first["messages"][1]["quote"],
+            json!({"message_id":"501","sender_wxid":"wxid_friend"})
+        );
+        assert_eq!(fixture.read(old["next_cursor"].as_str(), 2).unwrap(), first);
+        let second = fixture.read(first["next_cursor"].as_str(), 2).unwrap();
+        assert_eq!(
+            second["messages"][0]["quote"],
+            json!({"message_id":"102","sender_wxid":"wxid_prefix"})
+        );
+        assert_eq!(
+            second["messages"][1]["quote"],
+            json!({"message_id":"999999","sender_wxid":null})
+        );
+        let third = fixture.read(second["next_cursor"].as_str(), 2).unwrap();
+        assert_eq!(
+            third["messages"][0]["quote"],
+            json!({"message_id":"601","sender_wxid":null})
+        );
+        assert_eq!(
+            third["messages"][1]["quote"],
+            json!({"message_id":"101","sender_wxid":"wxid_service"})
+        );
+        let last = fixture.read(third["next_cursor"].as_str(), 2).unwrap();
+        assert_eq!(last["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(last["messages"][0]["server_id"], "501");
+        assert_eq!(last["has_more"], false);
+    }
+
+    #[test]
+    fn damaged_source_only_empties_its_fields_and_keeps_the_batch_and_quote() {
+        use rusqlite::types::Value as SqlValue;
+        let fixture = Fixture::new();
+        let conn = fixture.shard(0);
+        let table = format!("Msg_{:x}", md5::compute(CHAT));
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN source; ALTER TABLE {table} ADD COLUMN WCDB_CT_source"
+        ))
+        .unwrap();
+        let cases = [
+            (SqlValue::Blob(vec![0xff]), SqlValue::Integer(0)),
+            (SqlValue::Blob(b"not zstd".to_vec()), SqlValue::Integer(4)),
+            (
+                SqlValue::Blob(zstd::encode_all(&[0xff][..], 1).unwrap()),
+                SqlValue::Integer(4),
+            ),
+            (SqlValue::Integer(42), SqlValue::Integer(0)),
+            (SqlValue::Null, SqlValue::Integer(4)),
+            (
+                SqlValue::Text("<msgsource/>".into()),
+                SqlValue::Text("invalid".into()),
+            ),
+        ];
+        let xml = "<msg><appmsg><type>57</type><refermsg><svrid>101</svrid><chatusr>wxid_service</chatusr></refermsg></appmsg></msg>";
+        for (index, (source, compression)) in cases.iter().enumerate() {
+            Fixture::insert(&conn, 201 + index as i64, 100, 2, xml);
+            conn.execute(&format!("UPDATE {table} SET local_type=49,source=?1,WCDB_CT_source=?2 WHERE server_id=?3"), rusqlite::params![source,compression,201 + index as i64]).unwrap();
+        }
+        let page = fixture.read(None, 20).unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), cases.len());
+        for message in page["messages"].as_array().unwrap() {
+            assert_eq!(message["mentions"], json!([]));
+            assert_eq!(message["raw"], json!({"message_content":xml,"source":null}));
+            assert_eq!(
+                message["quote"],
+                json!({"message_id":"101","sender_wxid":"wxid_service"})
+            );
+        }
+        assert_eq!(fixture.read(None, 20).unwrap()["messages"], json!([]));
+    }
+
+    #[test]
+    fn source_without_compression_column_still_exposes_mentions_and_raw() {
+        let fixture = Fixture::new();
+        let conn = fixture.shard(0);
+        Fixture::insert(&conn, 101, 100, 2, "text");
+        let source = "<msgsource><atuserlist>wxid_service</atuserlist></msgsource>";
+        conn.execute_batch(&format!(
+            "ALTER TABLE Msg_{:x} ADD COLUMN source TEXT",
+            md5::compute(CHAT)
+        ))
+        .unwrap();
+        conn.execute(
+            &format!("UPDATE Msg_{:x} SET source=?1", md5::compute(CHAT)),
+            [source],
+        )
+        .unwrap();
+        let page = fixture.read(Some(""), 10).unwrap();
+        assert_eq!(page["messages"][0]["mentions"], json!(["wxid_service"]));
+        assert_eq!(
+            page["messages"][0]["raw"],
+            json!({"message_content":"text","source":source})
+        );
+    }
+
+    #[test]
+    fn quote_lookup_database_errors_do_not_advance_the_checkpoint() {
+        let fixture = Fixture::new();
+        let conn = fixture.shard(0);
+        Fixture::insert(&conn, 101, 100, 1, "old");
+        fixture.read(None, 1).unwrap();
+        conn.execute_batch("ALTER TABLE Name2Id RENAME TO senders;
+            CREATE VIEW Name2Id AS SELECT rowid, CASE WHEN rowid=1 THEN abs(-9223372036854775808) ELSE user_name END AS user_name FROM senders;").unwrap();
+        Fixture::insert(
+            &conn,
+            201,
+            100,
+            2,
+            "<msg><appmsg><type>57</type><refermsg><svrid>101</svrid></refermsg></appmsg></msg>",
+        );
+        conn.execute_batch(&format!(
+            "UPDATE Msg_{:x} SET local_type=49 WHERE server_id=201",
+            md5::compute(CHAT)
+        ))
+        .unwrap();
+        let error = fixture.read(None, 1).unwrap_err();
+        assert_eq!(
+            crate::cli::account::error_json(&error)["error"]["code"],
+            "INTERNAL"
+        );
+        assert!(error.to_string().contains("integer overflow"), "{error}");
+        conn.execute_batch("DROP VIEW Name2Id; ALTER TABLE senders RENAME TO Name2Id")
+            .unwrap();
+        let page = fixture.read(None, 1).unwrap();
+        assert_eq!(page["messages"][0]["server_id"], "201");
+        assert_eq!(
+            page["messages"][0]["quote"],
+            json!({"message_id":"101","sender_wxid":ACCOUNT})
+        );
+    }
+
+    #[test]
     fn same_second_and_late_messages_advance_by_local_id() {
         let fixture = Fixture::new();
         let conn = fixture.shard(0);
@@ -474,8 +852,8 @@ mod tests {
         assert_eq!(
             first["messages"],
             json!([
-                {"server_id":"9007199254740993","svrid":"9007199254740993","local_id":1,"chat_wxid":CHAT,"sender_wxid":"wxid_friend","is_self":false,"timestamp":100,"type":1,"text":"甲","shard":"message/message_0.db"},
-                {"server_id":"9007199254740994","svrid":"9007199254740994","local_id":2,"chat_wxid":CHAT,"sender_wxid":ACCOUNT,"is_self":true,"timestamp":100,"type":1,"text":"乙","shard":"message/message_0.db"}
+                {"server_id":"9007199254740993","svrid":"9007199254740993","local_id":1,"chat_wxid":CHAT,"sender_wxid":"wxid_friend","is_self":false,"timestamp":100,"type":1,"text":"甲","shard":"message/message_0.db","mentions":[],"quote":null,"raw":{"message_content":"wxid_friend:\n甲","source":null}},
+                {"server_id":"9007199254740994","svrid":"9007199254740994","local_id":2,"chat_wxid":CHAT,"sender_wxid":ACCOUNT,"is_self":true,"timestamp":100,"type":1,"text":"乙","shard":"message/message_0.db","mentions":[],"quote":null,"raw":{"message_content":"乙","source":null}}
             ])
         );
         assert_eq!(first["has_more"], true);

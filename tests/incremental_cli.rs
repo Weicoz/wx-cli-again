@@ -37,7 +37,24 @@ fn incremental_json_selects_account_pid_and_resumes_after_restart() {
         drop(contacts);
         let messages = Connection::open(db_dir.join("message/message_0.db")).unwrap();
         let table = format!("Msg_{:x}", md5::compute("123@chatroom"));
-        messages.execute_batch(&format!("CREATE TABLE Name2Id(user_name TEXT); INSERT INTO Name2Id VALUES('{account}'); CREATE TABLE [{table}](local_id INTEGER PRIMARY KEY AUTOINCREMENT,server_id INTEGER,local_type INTEGER,create_time INTEGER,real_sender_id INTEGER,message_content TEXT,WCDB_CT_message_content INTEGER); INSERT INTO [{table}](server_id,local_type,create_time,real_sender_id,message_content,WCDB_CT_message_content) VALUES({server},1,100,1,'one',0),({},1,100,1,'two',0);",server+1)).unwrap();
+        messages.execute_batch(&format!("CREATE TABLE Name2Id(user_name TEXT); INSERT INTO Name2Id VALUES('{account}'); CREATE TABLE [{table}](local_id INTEGER PRIMARY KEY AUTOINCREMENT,server_id INTEGER,local_type INTEGER,create_time INTEGER,real_sender_id INTEGER,message_content TEXT,WCDB_CT_message_content INTEGER,source BLOB,WCDB_CT_source INTEGER); INSERT INTO [{table}](server_id,local_type,create_time,real_sender_id,message_content,WCDB_CT_message_content) VALUES({server},1,100,1,'one',0),({},1,100,1,'two',0);",server+1)).unwrap();
+        let source =
+            "<msgsource><atuserlist><![CDATA[wxid_service,wxid_friend]]></atuserlist></msgsource>";
+        messages
+            .execute(
+                &format!("UPDATE [{table}] SET source=?1,WCDB_CT_source=4 WHERE server_id=?2"),
+                rusqlite::params![zstd::encode_all(source.as_bytes(), 1).unwrap(), server],
+            )
+            .unwrap();
+        let quote = format!("<msg><appmsg><type>57</type><refermsg><svrid>{server}</svrid><fromusr>wxid_wrong</fromusr></refermsg></appmsg></msg>");
+        messages
+            .execute(
+                &format!(
+                    "UPDATE [{table}] SET message_content=?1,local_type=49 WHERE server_id=?2"
+                ),
+                rusqlite::params![quote, server + 1],
+            )
+            .unwrap();
         drop(messages);
     }
     let invoke = |account: &str, pid: &str, cursor: Option<&str>| {
@@ -74,12 +91,30 @@ fn incremental_json_selects_account_pid_and_resumes_after_restart() {
     let (ok, alpha) = invoke("wxid_alpha", "4242", None);
     assert!(ok, "{alpha}");
     assert_eq!(alpha["messages"][0]["server_id"], "101");
+    assert_eq!(
+        alpha["messages"][0]["mentions"],
+        json!(["wxid_service", "wxid_friend"])
+    );
+    assert_eq!(
+        alpha["messages"][0]["raw"],
+        json!({"message_content":"one","source":"<msgsource><atuserlist><![CDATA[wxid_service,wxid_friend]]></atuserlist></msgsource>"})
+    );
+    assert!(alpha["messages"][0]
+        .as_object()
+        .unwrap()
+        .contains_key("quote"));
+    assert_eq!(alpha["messages"][0]["quote"], Value::Null);
     let (ok, beta) = invoke("wxid_beta", "4242", None);
     assert!(ok, "{beta}");
     assert_eq!(beta["messages"][0]["server_id"], "201");
     let (ok, next) = invoke("wxid_alpha", "4242", None);
     assert!(ok, "{next}");
     assert_eq!(next["messages"][0]["server_id"], "102");
+    assert_eq!(
+        next["messages"][0]["quote"],
+        json!({"message_id":"101","sender_wxid":"wxid_alpha"})
+    );
+    assert_eq!(next["messages"][0]["mentions"], json!([]));
     let (ok, replay) = invoke("wxid_alpha", "4242", Some(""));
     assert!(ok, "{replay}");
     assert_eq!(replay, alpha);
