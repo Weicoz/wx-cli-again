@@ -477,7 +477,7 @@ Windows 管道名为 `wx-cli-<SHA-256(账号配置目录路径)>`，完整路径
 Windows 自动启动 daemon 使用 `CreateProcessW(bInheritHandles=false)`；daemon 在自身进程内打开日志，避免调用方捕获 stdout/stderr 时等待 daemon 关闭句柄。
 
 
-## 按 ID 游标增量读取（fork 契约，票 03）
+## 按 ID 游标增量读取（fork 契约，票 03/04）
 
 ```bash
 # 首次：空游标，从该会话各分片的首个 local_id 开始
@@ -506,14 +506,28 @@ wx --wxid wxid_example incremental '123@chatroom' --limit 200
     "is_self": false,
     "timestamp": 1792454400,
     "type": 1,
-    "text": "消息正文"
+    "text": "消息正文",
+    "mentions": [],
+    "quote": null,
+    "raw": {
+      "message_content": "wxid_sender:\n消息正文",
+      "source": "<msgsource/>"
+    }
   }],
   "next_cursor": "<opaque-token>",
   "has_more": false
 }
 ```
 
-`server_id` 与 `svrid` 为相同的十进制字符串，避免 JavaScript 丢失 64 位精度。`local_id` 为分片、会话表内自增 ID；`type` 为 local_type 低 32 位数值，`timestamp` 为 Unix 秒。`text` 为 TEXT/BLOB 解码及 WCDB zstd 解压后的正文，移除已识别的群发送者前缀；XML 保留原文，本票不新增 @ 或引用字段。发送者先取该分片 Name2Id，缺失时取群正文前缀；无法确认时 `sender_wxid` 与 `is_self` 为 null，不猜本人。server_id 未分配（0/null）时返回 MESSAGE_NOT_READY，且不推进，等待入库完成后重试。
+`server_id` 与 `svrid` 为相同的十进制字符串，避免 JavaScript 丢失 64 位精度。`local_id` 为分片、会话表内自增 ID；`type` 为 local_type 低 32 位数值，`timestamp` 为 Unix 秒。`text` 为 TEXT/BLOB 解码及 WCDB zstd 解压后的正文，移除已识别的群发送者前缀；XML 保留原文。发送者先取该分片 Name2Id，缺失时取群正文前缀；无法确认时 `sender_wxid` 与 `is_self` 为 null，不猜本人。server_id 未分配（0/null）时返回 MESSAGE_NOT_READY，且不推进，等待入库完成后重试。
+
+每条消息附带以下结构化字段（下划线命名）：
+
+- `mentions`：从 `source` 的 `msgsource/atuserlist` 读取成员 wxid，支持 CDATA、逗号分隔，去除首尾空白与空项；`@所有人` 保留原始标识 `notify@all`，不展开成员、不按昵称推断。无列表、source 缺失或 XML 解析失败时为 `[]`。
+- `quote`：仅消息类型 49、`appmsg/type=57` 的引用消息返回对象，例如 `{"message_id":"9007199254740993","sender_wxid":"wxid_service"}`。`message_id` 来自 `refermsg/svrid`，保留十进制字符串；`sender_wxid` 优先取 `refermsg/chatusr`。chatusr 缺失或为空时，按 svrid 在当前账号、当前群的全部本地消息分片回查（含游标之前及本批之外的消息），复用 Name2Id / 正文前缀识别发送者。不使用 fromusr 或 displayname 猜测；查不到时 `sender_wxid` 为 null。引用子字段缺失或无效时为 null；非引用、缺 refermsg 或 XML 解析失败时 `quote` 为 null。
+- `raw`：`{"message_content":"消息记录原文","source":"source XML"}`。两者均为 TEXT/BLOB 的 UTF-8 文本，WCDB 压缩标记为 4 时先做 zstd 解压。`message_content` 保留群发送者前缀与 XML，不做正文格式化；source 保留 XML 原文，即使 XML 无法解析。source 列不存在、值为 NULL 或解码失败时 `raw.source` 为 null；缺压缩标记列时按未压缩读取。
+
+新增字段的缺失、XML 解析或 source 解压失败只置空对应字段，不中断批次。原有正文解码、数据库与游标错误契约保持不变。持久化批次原样重放；升级前已保存的批次仍按原 JSON 返回，只有新读取的批次包含新增字段。
 
 按分片相对路径字典序、各表 local_id 升序分页；不保证跨分片发送时间顺序。晚到消息、同秒消息均按入库 ID 读取。游标包含版本、账号、会话表、各分片代际与已读 ID。每次从磁盘发现新 message_N.db；新分片从首行读起，不依赖旧密钥索引。任一分片缺钥、查询失败均整体失败，不交付残缺批次。已有分片或表消失、代际锚点改变时报 DB_ROTATED；不会清空游标或自动从头读。
 
