@@ -33,9 +33,10 @@ fn selected_profile_reads_its_own_identity_and_groups_without_messages() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let mut outputs = Vec::new();
-    for (wxid, nickname, group) in [
-        ("wxid_alpha", "甲", "101@chatroom"),
-        ("wxid_beta", "乙", "202@chatroom"),
+    for (wxid, nickname, group, room_column) in [
+        ("wxid_alpha", "甲", "101@chatroom", "username"),
+        ("wxid_beta", "乙", "202@chatroom", "chat_room_name"),
+        ("wxid_gamma", "丙", "303@chatroom", "name"),
     ] {
         let profile = root
             .join("accounts")
@@ -52,11 +53,16 @@ fn selected_profile_reads_its_own_identity_and_groups_without_messages() {
         )
         .unwrap();
         let conn = rusqlite::Connection::open(db_dir.join("contact/contact.db")).unwrap();
-        conn.execute_batch("CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT); CREATE TABLE chat_room(id INTEGER PRIMARY KEY, username TEXT, ext_buffer BLOB); CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);").unwrap();
+        conn.execute_batch(&format!("CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT); CREATE TABLE chat_room(id INTEGER PRIMARY KEY, {room_column} TEXT, ext_buffer BLOB); CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);")).unwrap();
         conn.execute("INSERT INTO contact VALUES(1,?1,?2,'')", [wxid, nickname])
             .unwrap();
         conn.execute("INSERT INTO contact VALUES(2,?1,'客服群','')", [group])
             .unwrap();
+        conn.execute(
+            "INSERT INTO contact VALUES(4,'001@chatroom','新群','新群备注')",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO contact VALUES(3,'friend','朋友','备注')", [])
             .unwrap();
         conn.execute("INSERT INTO chat_room VALUES(8,?1,NULL)", [group])
@@ -90,11 +96,38 @@ fn selected_profile_reads_its_own_identity_and_groups_without_messages() {
             serde_json::json!({"wxid":wxid,"displayName":nickname})
         );
         let groups = invoke("groups");
+        let complete_group = serde_json::json!({"wxid":group,"displayName":"客服群","memberCount":2,"members":[{"wxid":"friend","displayName":"Group Card"},{"wxid":wxid,"displayName":nickname}],"membersComplete":true});
         assert_eq!(
             groups,
-            serde_json::json!([{"wxid":group,"displayName":"客服群","memberCount":2,"members":[{"wxid":"friend","displayName":"Group Card"},{"wxid":wxid,"displayName":nickname}]}])
+            serde_json::json!([
+                {"wxid":"001@chatroom","displayName":"新群备注","memberCount":0,"members":[],"membersComplete":false},
+                complete_group
+            ])
         );
         outputs.push(groups);
+        let conn = rusqlite::Connection::open(db_dir.join("contact/contact.db")).unwrap();
+        conn.execute("INSERT INTO chat_room VALUES(9,'001@chatroom',NULL)", [])
+            .unwrap();
+        assert_eq!(
+            invoke("groups"),
+            serde_json::json!([
+                {"wxid":"001@chatroom","displayName":"新群备注","memberCount":0,"members":[],"membersComplete":true},
+                complete_group
+            ])
+        );
+        conn.execute("INSERT INTO chatroom_member VALUES(9,1)", [])
+            .unwrap();
+        assert_eq!(
+            invoke("groups"),
+            serde_json::json!([
+                {"wxid":"001@chatroom","displayName":"新群备注","memberCount":1,"members":[{"wxid":wxid,"displayName":nickname}],"membersComplete":true},
+                complete_group
+            ])
+        );
+        conn.execute("DELETE FROM contact WHERE username LIKE '%@chatroom'", [])
+            .unwrap();
+        assert_eq!(invoke("groups"), serde_json::json!([]));
+        assert!(!profile.join("daemon.pid").exists());
     }
     assert_ne!(outputs[0], outputs[1]);
     std::fs::remove_dir_all(root).unwrap();
@@ -150,6 +183,25 @@ fn json_contract_distinguishes_keys_schema_login_and_internal_errors() {
     invoke("whoami", "wxid_errors", "VERSION_UNSUPPORTED");
     invoke("groups", "wxid_errors", "VERSION_UNSUPPORTED");
     invoke("whoami", "../invalid", "INTERNAL");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT); INSERT INTO contact VALUES(1,'wxid_errors','本人',''),(2,'101@chatroom','群',''); CREATE TABLE chat_room(id TEXT, username TEXT); CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER); INSERT INTO chat_room VALUES('bad-id','101@chatroom');").unwrap();
+    // SQL 数据读取失败不得吞掉后伪报版本错误。
+    invoke("groups", "wxid_errors", "INTERNAL");
+    conn.execute_batch("DROP TABLE chat_room").unwrap();
+    invoke("groups", "wxid_errors", "VERSION_UNSUPPORTED");
+    conn.execute_batch("CREATE TABLE chat_room(id INTEGER, unknown_name TEXT)")
+        .unwrap();
+    invoke("groups", "wxid_errors", "VERSION_UNSUPPORTED");
+    conn.execute_batch("DROP TABLE chat_room; CREATE TABLE chat_room(id INTEGER, username TEXT); DROP TABLE chatroom_member;").unwrap();
+    invoke("groups", "wxid_errors", "VERSION_UNSUPPORTED");
+    conn.execute_batch("CREATE TABLE chatroom_member(wrong_room_id INTEGER, member_id INTEGER)")
+        .unwrap();
+    invoke("groups", "wxid_errors", "VERSION_UNSUPPORTED");
+    drop(conn);
+    let mut corrupt = vec![0xabu8; 4096];
+    corrupt[..16].copy_from_slice(b"SQLite format 3\0");
+    std::fs::write(&path, corrupt).unwrap();
+    invoke("groups", "wxid_errors", "INTERNAL");
     let overlap = root.join("data/wxid_errors_abcd/db_storage");
     std::fs::create_dir_all(overlap.join("contact")).unwrap();
     let conn = rusqlite::Connection::open(overlap.join("contact/contact.db")).unwrap();

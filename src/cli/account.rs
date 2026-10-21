@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 #[derive(Debug)]
@@ -47,12 +48,18 @@ fn open_contact(cfg: &crate::config::Config) -> Result<rusqlite::Connection> {
     open_database(cfg, "contact/contact.db")
 }
 
-pub(crate) fn open_database(cfg: &crate::config::Config, rel: &str) -> Result<rusqlite::Connection> {
+pub(crate) fn open_database(
+    cfg: &crate::config::Config,
+    rel: &str,
+) -> Result<rusqlite::Connection> {
     use anyhow::Context;
     use std::io::Read;
     let path = cfg.db_dir.join(rel);
     if !path.is_file() {
-        return Err(reader_error("LOGIN_REQUIRED", format!("目标账号缺少数据库 {rel}")));
+        return Err(reader_error(
+            "LOGIN_REQUIRED",
+            format!("目标账号缺少数据库 {rel}"),
+        ));
     }
     let mut header = [0u8; 16];
     std::fs::File::open(&path)?.read_exact(&mut header)?;
@@ -78,6 +85,7 @@ pub(crate) fn open_database(cfg: &crate::config::Config, rel: &str) -> Result<ru
 fn schema_error(error: rusqlite::Error) -> anyhow::Error {
     match &error {
         rusqlite::Error::SqliteFailure(_, Some(message))
+        | rusqlite::Error::SqlInputError { msg: message, .. }
             if message.starts_with("no such table:") || message.starts_with("no such column:") =>
         {
             reader_error(
@@ -152,36 +160,50 @@ fn groups(conn: &rusqlite::Connection) -> Result<Value> {
         .map_err(schema_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(schema_error)?;
+    let mut room_queries = Vec::new();
+    for column in ["username", "chat_room_name", "name"] {
+        match conn.prepare(&format!("SELECT id FROM chat_room WHERE {column}=?")) {
+            Ok(stmt) => room_queries.push(stmt),
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            | Err(rusqlite::Error::SqlInputError { msg: message, .. })
+                if message.starts_with("no such column:") => {}
+            Err(error) => return Err(schema_error(error)),
+        }
+    }
+    if room_queries.is_empty() {
+        return Err(reader_error(
+            "VERSION_UNSUPPORTED",
+            "当前微信联系人或群成员表结构不受支持",
+        ));
+    }
+    let mut member_query = conn.prepare("SELECT DISTINCT c.username, c.nick_name, c.remark FROM chatroom_member cm LEFT JOIN contact c ON c.id=cm.member_id WHERE cm.room_id=? ORDER BY c.username").map_err(schema_error)?;
     let mut result = Vec::new();
     for (wxid, nickname, remark) in rooms {
-        let room_id = ["username", "chat_room_name", "name"]
-            .iter()
-            .find_map(|column| {
-                conn.query_row(
-                    &format!("SELECT id FROM chat_room WHERE {column}=?"),
-                    [&wxid],
-                    |row| row.get::<_, i64>(0),
-                )
-                .ok()
-            })
-            .ok_or_else(|| {
-                reader_error(
-                    "VERSION_UNSUPPORTED",
-                    "群缺少 chat_room 记录，无法确认完整成员列表",
-                )
-            })?;
-        let mut stmt = conn.prepare("SELECT DISTINCT c.username, c.nick_name, c.remark FROM chatroom_member cm LEFT JOIN contact c ON c.id=cm.member_id WHERE cm.room_id=? ORDER BY c.username").map_err(schema_error)?;
-        let members = stmt
-            .query_map([room_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                ))
-            })
-            .map_err(schema_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(schema_error)?;
+        let mut room_id = None;
+        for query in &mut room_queries {
+            room_id = query
+                .query_row([&wxid], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(schema_error)?;
+            if room_id.is_some() {
+                break;
+            }
+        }
+        let members = if let Some(room_id) = room_id {
+            member_query
+                .query_map([room_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ))
+                })
+                .map_err(schema_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(schema_error)?
+        } else {
+            Vec::new()
+        };
         let group_names =
             crate::daemon::query::load_group_nickname_map_from_conn(conn, &wxid, None);
         let members: Vec<_> = members
@@ -195,7 +217,7 @@ fn groups(conn: &rusqlite::Connection) -> Result<Value> {
                 json!({"wxid": id, "displayName": display})
             })
             .collect();
-        result.push(json!({"wxid":wxid,"displayName":display_name(&wxid, &nickname, &remark),"memberCount":members.len(),"members":members}));
+        result.push(json!({"wxid":wxid,"displayName":display_name(&wxid, &nickname, &remark),"memberCount":members.len(),"members":members,"membersComplete":room_id.is_some()}));
     }
     Ok(Value::Array(result))
 }

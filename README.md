@@ -456,10 +456,19 @@ Windows 管道名为 `wx-cli-<SHA-256(账号配置目录路径)>`，完整路径
 `groups --json` 成功（stdout 数组，退出码 0）：
 
 ```json
-[{"wxid":"123@chatroom","displayName":"客服群","memberCount":2,"members":[{"wxid":"wxid_a","displayName":"群昵称甲"},{"wxid":"wxid_b","displayName":"联系人乙"}]}]
+[
+  {"wxid":"123@chatroom","displayName":"客服群","memberCount":2,"members":[{"wxid":"wxid_a","displayName":"群昵称甲"},{"wxid":"wxid_b","displayName":"联系人乙"}],"membersComplete":true},
+  {"wxid":"456@chatroom","displayName":"新建群","memberCount":0,"members":[],"membersComplete":false}
+]
 ```
 
-群按 wxid 排序，成员按 wxid 排序。成员显示名依次取群昵称、联系人备注、联系人昵称、wxid。只从联系人与群成员表读取完整成员；不扫描消息、不以发言者推算成员数。成员结构不支持或群记录缺失时返回错误，不报告不完整列表。空群返回 `memberCount: 0`、`members: []`；无群返回 `[]`。
+每个群固定包含 `wxid`（字符串）、`displayName`（字符串）、`memberCount`（非负整数）、`members`（数组）、`membersComplete`（布尔值）五个字段；成员固定包含字符串 `wxid`、`displayName`。消费端必须同步接受新增的 `membersComplete` 字段。
+
+群按 wxid 排序，成员按 wxid 排序。群显示名依次取联系人备注、联系人昵称、wxid；成员显示名依次取群昵称、联系人备注、联系人昵称、wxid。只从联系人与群成员表读取成员；不扫描消息、不以发言者推算成员数。
+
+`membersComplete: true` 表示群有 `chat_room` 记录且成员查询成功。单个群暂缺该记录（例如新建群尚未写全）时，仍输出 wxid 与显示名，返回 `membersComplete: false`、`members: []`，其余群不受影响。`memberCount` 始终等于本次返回的 `members.length`；标记为 false 时，0 不代表真实成员总数为 0。群记录存在但成员为空时返回 `membersComplete: true`、`memberCount: 0`、`members: []`；无群返回 `[]`。
+
+联系人/群表或必需列不兼容时返回 `VERSION_UNSUPPORTED`；数据库读取等内部错误返回 `INTERNAL`，不伪装成不完整列表。单个群缺记录属于数据尚未完整，不返回版本错误。
 
 两条命令每次直接核对数据库占用与本人联系人，随后只读打开源库，不使用旧 daemon 缓存推断当前登录身份。联系人表必须包含本人，且账号目录必须能唯一匹配本人 wxid。无法确认则失败。明文 SQLite 可直接只读查询，加密库使用该账号已有密钥；两条命令均不会自动扫描进程内存取钥。
 
