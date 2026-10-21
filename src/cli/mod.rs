@@ -1,3 +1,4 @@
+pub mod account;
 pub mod attachments;
 pub mod biz_articles;
 pub mod contacts;
@@ -42,6 +43,12 @@ const MSG_TYPE_HELP: &str = "消息类型过滤 [text|image|voice|video|card|sti
 #[derive(Parser)]
 #[command(name = "wx", version = env!("CARGO_PKG_VERSION"), about = "wx — 微信本地数据 CLI")]
 pub struct Cli {
+    /// 选择账号；所有配置、IPC、缓存和读取状态按此隔离
+    #[arg(long, global = true)]
+    wxid: Option<String>,
+    /// 指定持有目标账号数据库的微信主进程
+    #[arg(long, global = true)]
+    pid: Option<u32>,
     /// 返回更重的 freshness/source 元数据（如 per-shard latest、cache modes）
     #[arg(long, global = true)]
     with_meta: bool,
@@ -54,6 +61,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 当前登录账号身份
+    Whoami {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 群列表及完整成员（不读消息）
+    Groups {
+        #[arg(long)]
+        json: bool,
+    },
     /// 初始化：检测数据目录并扫描加密密钥
     Init {
         /// 强制重新扫描（与已有有效密钥合并，不会因部分失败而清空）
@@ -443,16 +460,24 @@ pub enum DaemonCommands {
 
 pub fn run() {
     let cli = Cli::parse();
+    let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true });
     if let Err(e) = dispatch(cli) {
+        if contract_json {
+            println!("{}", account::error_json(&e));
+            std::process::exit(1);
+        }
         eprintln!("错误: {}", e);
         std::process::exit(1);
     }
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
+    crate::config::select_account(cli.wxid.as_deref(), cli.pid)?;
     let base_with_meta = cli.with_meta;
     let base_debug_source = cli.debug_source;
     match cli.command {
+        Commands::Whoami { json } => account::cmd_whoami(json),
+        Commands::Groups { json } => account::cmd_groups(json),
         Commands::Init {
             force,
             hook_seconds,

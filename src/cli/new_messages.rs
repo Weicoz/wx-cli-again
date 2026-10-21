@@ -5,10 +5,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 fn state_file() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".wx-cli")
-        .join("last_check.json")
+    crate::config::cli_dir().join("last_check.json")
 }
 
 /// 加载上次的 per-session 时间戳快照

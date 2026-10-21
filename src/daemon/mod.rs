@@ -47,11 +47,29 @@ pub(crate) fn collect_db_keys(
 ///
 /// 当 WX_DAEMON_MODE 环境变量设置时，main() 调用此函数
 pub fn run() {
+    #[cfg(windows)]
+    let _log = match windows_daemon_log() {
+        Ok(log) => log,
+        Err(_) => std::process::exit(1),
+    };
     let rt = tokio::runtime::Runtime::new().expect("无法创建 tokio runtime");
     if let Err(e) = rt.block_on(async_run()) {
         eprintln!("[daemon] 启动失败: {}", e);
         std::process::exit(1);
     }
+}
+
+#[cfg(windows)]
+fn windows_daemon_log() -> Result<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(config::log_path())?;
+    unsafe {
+        SetStdHandle(STD_ERROR_HANDLE, HANDLE(log.as_raw_handle()))?;
+        SetStdHandle(STD_OUTPUT_HANDLE, HANDLE(log.as_raw_handle()))?;
+    }
+    Ok(log)
 }
 
 async fn async_run() -> Result<()> {
@@ -69,6 +87,9 @@ async fn async_run() -> Result<()> {
 
     // 加载配置
     let cfg = config::load_config()?;
+    if config::selected_account().is_some() {
+        crate::cli::account::verify_configured_identity(&cfg)?;
+    }
     eprintln!("[daemon] DB_DIR: {}", cfg.db_dir.display());
 
     // 加载密钥

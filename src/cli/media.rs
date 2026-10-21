@@ -9,6 +9,9 @@ use crate::crypto::sqlcipher;
 /// 从 message/media_*.db 的 VoiceInfo 表按 svr_id 导出 voice_data。
 pub fn cmd_voice_export(svr_id: i64, chat: Option<String>, output: String) -> Result<()> {
     let cfg = config::load_config().context("请先 wx init")?;
+    if config::selected_account().is_some() {
+        super::account::verify_configured_identity(&cfg)?;
+    }
     let keys: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cfg.keys_file).context("读取密钥失败")?)?;
 

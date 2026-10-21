@@ -9,9 +9,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
-};
 use windows::Win32::System::Memory::{
     VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
 };
@@ -24,41 +21,8 @@ use super::{
 
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
-/// 查找 Weixin.exe 进程 PID
-fn find_wechat_pid() -> Option<u32> {
-    // SAFETY: CreateToolhelp32Snapshot 标准 Windows API
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
-
-    let mut entry = PROCESSENTRY32 {
-        dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
-        ..Default::default()
-    };
-
-    // SAFETY: Process32First/Process32Next 标准快照遍历
-    unsafe {
-        if Process32First(snap, &mut entry).is_err() {
-            let _ = CloseHandle(snap);
-            return None;
-        }
-        loop {
-            let name =
-                std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
-            if name.eq_ignore_ascii_case("Weixin.exe") {
-                let pid = entry.th32ProcessID;
-                let _ = CloseHandle(snap);
-                return Some(pid);
-            }
-            if Process32Next(snap, &mut entry).is_err() {
-                break;
-            }
-        }
-        let _ = CloseHandle(snap);
-    }
-    None
-}
-
 pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    let pid = find_wechat_pid().context("找不到 Weixin.exe 进程，请确认微信正在运行")?;
+    let pid = crate::process::find_for_db(Some(db_dir), crate::config::selected_pid()?)?;
     eprintln!("WeChat PID: {}", pid);
 
     // SAFETY: OpenProcess 请求读取权限
@@ -71,14 +35,15 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     eprintln!("找到 {} 个加密数据库", db_salts.len());
 
     eprintln!("扫描进程内存...");
-    let raw_keys = scan_memory(process)?;
-    eprintln!("找到 {} 个候选密钥", raw_keys.len());
+    let raw_keys = scan_memory(process);
 
     // SAFETY: 关闭进程句柄
     unsafe {
         let _ = CloseHandle(process);
     }
 
+    let raw_keys = raw_keys?;
+    eprintln!("找到 {} 个候选密钥", raw_keys.len());
     let entries = match_raw_keys(db_dir, &raw_keys, &db_salts);
     eprintln!(
         "匹配到 {}/{} 个数据库密钥（来自 {} 个候选 key）",

@@ -1758,7 +1758,7 @@ async fn load_group_nickname_maps(
     .await?
 }
 
-fn load_group_nickname_map_from_conn(
+pub(crate) fn load_group_nickname_map_from_conn(
     conn: &Connection,
     chat_username: &str,
     targets: Option<&HashSet<String>>,

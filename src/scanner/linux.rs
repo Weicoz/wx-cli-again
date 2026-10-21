@@ -69,7 +69,11 @@ fn parse_maps(pid: u32) -> Result<Vec<(u64, u64)>> {
 }
 
 pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
-    let pid = find_wechat_pid().context("找不到 WeChat 进程，请确认 WeChat 正在运行")?;
+    let pid = if crate::config::selected_account().is_some() || crate::config::selected_pid()?.is_some() {
+        crate::process::find_for_db(Some(db_dir), crate::config::selected_pid()?)?
+    } else {
+        find_wechat_pid().context("找不到 WeChat 进程，请确认 WeChat 正在运行")?
+    };
     eprintln!("WeChat PID: {}", pid);
 
     let db_salts = collect_db_salts(db_dir);

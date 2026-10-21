@@ -10,9 +10,6 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
-};
 use windows::Win32::System::Memory::{
     VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOCACHE, PAGE_NOACCESS, PAGE_READWRITE,
@@ -61,13 +58,13 @@ impl ImageKeyProvider for WindowsImageKeyProvider {
             .map_err(|err| anyhow::anyhow!("读取 config.db_dir 失败: {}", err))?;
         let db_dir = configured_db_dir_for_wxid(configured_db_dir, wxid);
         let attach_dir = attach_root_for_db_dir(&db_dir);
-        let key = derive_key_for_paths(&attach_dir)?;
+        let key = derive_key_for_paths(&attach_dir, &db_dir)?;
         self.cache.lock().unwrap().insert(cache_key, key);
         Ok(key)
     }
 }
 
-fn derive_key_for_paths(attach_dir: &std::path::Path) -> Result<ImageKeyMaterial> {
+fn derive_key_for_paths(attach_dir: &std::path::Path, db_dir: &std::path::Path) -> Result<ImageKeyMaterial> {
     let templates = find_v2_template_ciphertexts(attach_dir, 3, 64)?;
     if templates.is_empty() {
         bail!("在 {} 下找不到 V2 模板文件", attach_dir.display());
@@ -76,7 +73,7 @@ fn derive_key_for_paths(attach_dir: &std::path::Path) -> Result<ImageKeyMaterial
         .map(|(key, _, _)| key)
         .unwrap_or(0x88);
 
-    let pid = find_wechat_pid().context("找不到 Weixin.exe 进程，请确认微信正在运行")?;
+    let pid = crate::process::find_for_db(Some(db_dir), config::selected_pid()?)?;
     let process = unsafe {
         OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)
             .context("OpenProcess 失败，请以管理员权限运行")?
@@ -91,35 +88,6 @@ fn derive_key_for_paths(attach_dir: &std::path::Path) -> Result<ImageKeyMaterial
         aes_key: aes_key?,
         xor_key,
     })
-}
-
-fn find_wechat_pid() -> Option<u32> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()? };
-    let mut entry = PROCESSENTRY32 {
-        dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
-        ..Default::default()
-    };
-
-    unsafe {
-        if Process32First(snapshot, &mut entry).is_err() {
-            let _ = CloseHandle(snapshot);
-            return None;
-        }
-        loop {
-            let name =
-                std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
-            if name.eq_ignore_ascii_case("Weixin.exe") {
-                let pid = entry.th32ProcessID;
-                let _ = CloseHandle(snapshot);
-                return Some(pid);
-            }
-            if Process32Next(snapshot, &mut entry).is_err() {
-                break;
-            }
-        }
-        let _ = CloseHandle(snapshot);
-    }
-    None
 }
 
 fn scan_memory_for_key(process: HANDLE, templates: &[[u8; 16]]) -> Result<[u8; 16]> {

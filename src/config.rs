@@ -82,6 +82,11 @@ pub fn load_config() -> Result<Config> {
         .unwrap_or(default_wechat_process())
         .to_string();
 
+    if let Some(account) = selected_account() {
+        anyhow::ensure!(account_matches_dir(&account, &db_dir), "db_dir 与 --wxid 不匹配");
+        anyhow::ensure!(keys_file == base_dir.join("all_keys.json")
+            && decrypted_dir == base_dir.join("decrypted"), "账号配置的密钥和解密目录必须留在该账号目录");
+    }
     Ok(Config {
         db_dir,
         keys_file,
@@ -90,7 +95,10 @@ pub fn load_config() -> Result<Config> {
     })
 }
 
-fn find_config_file() -> Result<PathBuf> {
+pub fn find_config_file() -> Result<PathBuf> {
+    if selected_account().is_some() || std::env::var_os("WX_CLI_HOME").is_some() {
+        return Ok(cli_dir().join("config.json"));
+    }
     let cwd_dir = std::env::current_dir().ok();
     let exe_dir = std::env::current_exe()
         .ok()
@@ -144,7 +152,69 @@ fn home_config_path(home_dir: &Path) -> PathBuf {
 }
 
 pub fn cli_dir() -> PathBuf {
-    cli_home_dir().join(".wx-cli")
+    profile_dir(&cli_root(), selected_account().as_deref())
+}
+
+/// 指定账号时，不读取 cwd/exe 下的共用配置。
+pub fn selected_account() -> Option<String> {
+    std::env::var("WX_ACCOUNT").ok()
+}
+
+pub fn select_account(account: Option<&str>, pid: Option<u32>) -> Result<()> {
+    let account = account.map(str::to_owned).or_else(selected_account);
+    if let Some(ref account) = account {
+        anyhow::ensure!(!account.is_empty() && account.len() <= 128
+            && account.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "wxid 必须为 1-128 位字母、数字、下划线或短横线");
+        std::env::set_var("WX_ACCOUNT", account);
+    }
+    if let Some(pid) = pid {
+        anyhow::ensure!(pid > 0, "PID 必须大于 0");
+        std::env::set_var("WX_PID", pid.to_string());
+    }
+    Ok(())
+}
+
+pub fn selected_pid() -> Result<Option<u32>> {
+    std::env::var("WX_PID").ok().map(|s| {
+        let pid = s.parse::<u32>().context("WX_PID 必须为正整数")?;
+        anyhow::ensure!(pid > 0, "PID 必须大于 0");
+        Ok(pid)
+    }).transpose()
+}
+
+fn cli_root() -> PathBuf {
+    std::env::var_os("WX_CLI_HOME").map(PathBuf::from)
+        .unwrap_or_else(|| cli_home_dir().join(".wx-cli"))
+}
+
+pub(crate) fn profile_dir(root: &Path, account: Option<&str>) -> PathBuf {
+    match account {
+        Some(account) => root.join("accounts").join(scope_hash(account.as_bytes())),
+        None => root.to_path_buf(),
+    }
+}
+
+fn scope_hash(value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(value))
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn pipe_name() -> String {
+    pipe_name_for_dir(&cli_dir())
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn pipe_name_for_dir(dir: &Path) -> String {
+    format!("wx-cli-{}", scope_hash(dir.to_string_lossy().as_bytes()))
+}
+
+pub fn account_matches_dir(account: &str, db_dir: &Path) -> bool {
+    db_dir.parent().and_then(Path::file_name).and_then(|n| n.to_str())
+        .is_some_and(|name| name == account || name.strip_prefix(account)
+            .is_some_and(|suffix| suffix.strip_prefix('_')
+                .is_some_and(|hash| hash.len() == 4 && hash.bytes().all(|b| b.is_ascii_hexdigit()))))
 }
 
 fn cli_home_dir() -> PathBuf {
@@ -185,7 +255,12 @@ fn sudo_user_home_dir() -> Option<PathBuf> {
 }
 
 pub fn sock_path() -> PathBuf {
-    cli_dir().join("daemon.sock")
+    if selected_account().is_some() || std::env::var_os("WX_CLI_HOME").is_some() {
+        // macOS sockaddr_un 路径上限 104 字节，账号目录不直接用于 socket。
+        std::env::temp_dir().join(format!("wx-{}.sock", &scope_hash(cli_dir().to_string_lossy().as_bytes())[..32]))
+    } else {
+        cli_dir().join("daemon.sock")
+    }
 }
 
 pub fn pid_path() -> PathBuf {
@@ -270,6 +345,9 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
     }
     // 用 .db 最新 mtime，而不是 db_storage 目录自身 mtime：
     // 多账号时闲置账号目录若被 Finder/备份碰过 mtime，会误选。
+    if let Some(account) = selected_account() {
+        candidates.retain(|dir| account_matches_dir(&account, dir));
+    }
     candidates.sort_by_key(|p| latest_db_mtime(p).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
     candidates.into_iter().next_back()
 }
@@ -296,6 +374,9 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
         if old.is_dir() {
             candidates.push(old);
         }
+    }
+    if let Some(account) = selected_account() {
+        candidates.retain(|dir| account_matches_dir(&account, dir));
     }
     candidates.sort_by_key(|p| {
         // 排序：取 db_storage 目录下所有 .db 文件的最新 mtime，而非目录自身的 mtime
@@ -358,6 +439,9 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
                 }
             }
         }
+    }
+    if let Some(account) = selected_account() {
+        candidates.retain(|dir| account_matches_dir(&account, dir));
     }
     candidates.sort_by_key(|p| latest_db_mtime(p).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
     candidates.into_iter().next_back()
@@ -520,4 +604,31 @@ mod tests {
             assert_eq!(resolved, docs, "keyword {keyword:?}");
         }
     }
+    #[test]
+    fn account_scope_maps_config_keys_cache_and_state_without_collisions() {
+        use super::{profile_dir, pipe_name_for_dir};
+        let root = std::path::Path::new("fixture");
+        let a = profile_dir(root, Some("abc"));
+        assert_eq!(a, root.join("accounts/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        let b = profile_dir(root, Some("ABC"));
+        assert_ne!(a, b); // Windows 大小写不敏感文件系统上仍必须隔离。
+        assert_ne!(pipe_name_for_dir(&a), pipe_name_for_dir(&b));
+        for file in ["config.json", "all_keys.json", "cache", "last_check.json", "watch_state.json", "daemon.pid", "daemon.log"] {
+            assert_ne!(a.join(file), b.join(file));
+            assert!(a.join(file).starts_with(&a));
+        }
+        assert_eq!(profile_dir(root, None), root);
+    }
+
+    #[test]
+    fn account_directory_matching_does_not_accept_other_accounts_or_path_prefixes() {
+        use super::account_matches_dir;
+        for dir in ["data/wxid_a/db_storage", "data/wxid_a_12ab/db_storage"] {
+            assert!(account_matches_dir("wxid_a", std::path::Path::new(dir)));
+        }
+        for dir in ["data/wxid_ab/db_storage", "data/wxid_a_other/db_storage", "data/wxid_b/db_storage"] {
+            assert!(!account_matches_dir("wxid_a", std::path::Path::new(dir)));
+        }
+    }
+
 }

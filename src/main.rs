@@ -1,4 +1,5 @@
 mod config;
+mod process;
 mod ipc;
 mod crypto;
 mod scanner;
