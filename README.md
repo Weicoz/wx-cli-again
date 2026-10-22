@@ -588,3 +588,18 @@ wx --wxid wxid_example incremental '123@chatroom' --limit 200
 | LOGIN_REQUIRED / KEY_FAILED / VERSION_UNSUPPORTED / INTERNAL | 沿用票 02；结构不支持或正文损坏也返回 VERSION_UNSUPPORTED |
 
 参数语法错误由 clap 输出 stderr、退出码 2；执行期错误按上表输出 JSON。不能延续时保留原状态，由操作端报错并人工核实源库后恢复。
+
+
+### 按起点补读群消息（backfill）
+
+```bash
+wx --wxid wxid_example --pid 1234 backfill '123@chatroom' --since 1700000000 --until 1702592000 --cursor '' --limit 200
+# 续页保持账号、群和时间范围，传回 next_cursor；done=true 即结束
+wx --wxid wxid_example backfill '123@chatroom' --since 1700000000 --until 1702592000 --cursor '<next_cursor>' --limit 200
+```
+
+`since` / `until` 是必填 UTC Unix 秒，读取 `[since, until)`；首次 cursor 可省略。固定 JSON 输出含 `account_wxid`、`chat_wxid`、`messages`、`next_cursor`、`has_more`、`done`。消息结构、分片字典序与 local_id 升序均复用 incremental。`done = !has_more`，表示当前快照的窗口内消息已读完，不能用消息时间提前截断晚到记录。
+
+补读游标独立携带用途和时间范围，不读写 `incremental.db`。两种游标交叉传入会报 `CURSOR_KIND_MISMATCH`，补读续页改范围报 `CURSOR_RANGE_MISMATCH`。操作端串行安排补读与增量轮次、持久化 next_cursor 并按消息 ID 幂等入库。源库变动时补读不提供增量命令的持久化批次重放保证。
+
+完整参数、JSON 形状、错误码与调度语义见 [补读契约](docs/backfill.md)。真实 CLI 契约样例新增 `tests/fixtures/contract/backfill-first.json`、`backfill-next.json`、`backfill-done.json`，由合成库生成并逐字节比较，原有样例保持不变。

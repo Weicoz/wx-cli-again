@@ -241,6 +241,13 @@ fn groups_match_contract_including_incomplete_members() {
 fn missing_chat_matches_error_contract() {
     let fixture = Fixture::new("missing-chat");
     let stdout = fixture.invoke(&["incremental", "99999@chatroom", "--cursor", ""], 1);
+    assert_eq!(
+        fixture.invoke(
+            &["backfill", "99999@chatroom", "--since", "0", "--until", "1"],
+            1
+        ),
+        stdout
+    );
     let value = golden("error-chat-not-found.json", &stdout);
     assert_eq!(value["error"]["code"], "CHAT_NOT_FOUND");
 }
@@ -264,6 +271,13 @@ fn known_group_without_message_table_matches_empty_contract() {
     assert_eq!(value["messages"], json!([]));
     assert_eq!(value["has_more"], false);
     assert!(!value["next_cursor"].as_str().unwrap().is_empty());
+    let backfill: Value = serde_json::from_slice(
+        &fixture.invoke(&["backfill", EMPTY_CHAT, "--since", "0", "--until", "1"], 0),
+    )
+    .unwrap();
+    assert_eq!(backfill["messages"], json!([]));
+    assert_eq!(backfill["done"], true);
+    assert!(!backfill["next_cursor"].as_str().unwrap().is_empty());
 }
 
 #[cfg(target_os = "macos")]
@@ -298,4 +312,236 @@ fn incremental_matches_contract_with_mentions_quotes_and_system_message() {
         .iter()
         .all(|message| message["timestamp"] == 1700000000));
     assert_eq!(value["has_more"], true);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn backfill_reads_half_open_range_in_local_id_order_without_advancing_incremental() {
+    let fixture = Fixture::new("backfill-range");
+    fixture.add_messages();
+    let db = Connection::open(fixture.db_dir().join("message/message_0.db")).unwrap();
+    let table = format!("Msg_{:x}", md5::compute(CHAT));
+    db.execute_batch(&format!(
+        "UPDATE [{table}] SET create_time=CASE local_id
+        WHEN 1 THEN 1699999999 WHEN 2 THEN 1700000000 WHEN 3 THEN 1700000002
+        WHEN 4 THEN 1700000001 WHEN 5 THEN 1700000000 ELSE 1700000003 END;"
+    ))
+    .unwrap();
+    drop(db);
+    let read = |cursor: &str| -> Value {
+        serde_json::from_slice(&fixture.invoke(
+            &[
+                "backfill",
+                CHAT,
+                "--since",
+                "1700000000",
+                "--until",
+                "1700000002",
+                "--cursor",
+                cursor,
+                "--limit",
+                "2",
+            ],
+            0,
+        ))
+        .unwrap()
+    };
+    let first = read("");
+    assert_eq!(first["messages"][0]["local_id"], 2);
+    assert_eq!(first["messages"][1]["local_id"], 4);
+    assert_eq!(first["done"], false);
+    assert!(!fixture.profile().join("incremental.db").exists());
+    let second = read(first["next_cursor"].as_str().unwrap());
+    assert_eq!(second["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(second["messages"][0]["local_id"], 5);
+    assert_eq!(second["done"], true);
+    let end = read(second["next_cursor"].as_str().unwrap());
+    assert_eq!(end["messages"], json!([]));
+    assert_eq!(end["done"], true);
+    let incremental: Value =
+        serde_json::from_slice(&fixture.invoke(&["incremental", CHAT, "--limit", "1"], 0)).unwrap();
+    assert_eq!(incremental["messages"][0]["local_id"], 1);
+    read("");
+    let incremental: Value =
+        serde_json::from_slice(&fixture.invoke(&["incremental", CHAT, "--limit", "1"], 0)).unwrap();
+    assert_eq!(incremental["messages"][0]["local_id"], 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn backfill_rejects_wrong_cursor_kind_range_and_invalid_bounds() {
+    let fixture = Fixture::new("backfill-errors");
+    fixture.add_messages();
+    let base = [
+        "backfill",
+        CHAT,
+        "--since",
+        "1700000000",
+        "--until",
+        "1700000002",
+        "--limit",
+        "2",
+    ];
+    let first: Value = serde_json::from_slice(&fixture.invoke(&base, 0)).unwrap();
+    let incremental: Value = serde_json::from_slice(
+        &fixture.invoke(&["incremental", CHAT, "--cursor", "", "--limit", "2"], 0),
+    )
+    .unwrap();
+    let mut wrong_kind = base.to_vec();
+    wrong_kind.extend(["--cursor", incremental["next_cursor"].as_str().unwrap()]);
+    let error: Value = serde_json::from_slice(&fixture.invoke(&wrong_kind, 1)).unwrap();
+    assert_eq!(error["error"]["code"], "CURSOR_KIND_MISMATCH");
+    let error: Value = serde_json::from_slice(&fixture.invoke(
+        &[
+            "incremental",
+            CHAT,
+            "--cursor",
+            first["next_cursor"].as_str().unwrap(),
+        ],
+        1,
+    ))
+    .unwrap();
+    assert_eq!(error["error"]["code"], "CURSOR_KIND_MISMATCH");
+    let error: Value = serde_json::from_slice(&fixture.invoke(
+        &[
+            "backfill",
+            CHAT,
+            "--since",
+            "1700000001",
+            "--until",
+            "1700000002",
+            "--cursor",
+            first["next_cursor"].as_str().unwrap(),
+        ],
+        1,
+    ))
+    .unwrap();
+    assert_eq!(error["error"]["code"], "CURSOR_RANGE_MISMATCH");
+    for (since, until) in [
+        ("5", "5"),
+        ("6", "5"),
+        ("-1", "5"),
+        ("0", "9223372036854775807"),
+    ] {
+        let error: Value = serde_json::from_slice(
+            &fixture.invoke(&["backfill", CHAT, "--since", since, "--until", until], 1),
+        )
+        .unwrap();
+        assert_eq!(error["error"]["code"], "TIME_RANGE_INVALID");
+    }
+    let mut invalid = base.to_vec();
+    invalid.extend(["--cursor", "not.a.cursor"]);
+    let error: Value = serde_json::from_slice(&fixture.invoke(&invalid, 1)).unwrap();
+    assert_eq!(error["error"]["code"], "CURSOR_INVALID");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn backfill_pages_match_contract_with_incremental_message_shapes() {
+    let fixture = Fixture::new("backfill-contract");
+    fixture.add_messages();
+    let read = |cursor: &str| {
+        fixture.invoke(
+            &[
+                "backfill",
+                CHAT,
+                "--since",
+                "1700000000",
+                "--until",
+                "1700000001",
+                "--cursor",
+                cursor,
+                "--limit",
+                "5",
+            ],
+            0,
+        )
+    };
+    let first = golden("backfill-first.json", &read(""));
+    let incremental = golden(
+        "incremental.json",
+        &fixture.invoke(&["incremental", CHAT, "--cursor", "", "--limit", "5"], 0),
+    );
+    assert_eq!(first["messages"], incremental["messages"]);
+    assert_eq!(first["done"], false);
+    let next = golden(
+        "backfill-next.json",
+        &read(first["next_cursor"].as_str().unwrap()),
+    );
+    assert_eq!(next["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(next["messages"][0]["local_id"], 6);
+    assert_eq!(next["done"], true);
+    assert_eq!(next["has_more"], false);
+    let done = golden(
+        "backfill-done.json",
+        &read(next["next_cursor"].as_str().unwrap()),
+    );
+    assert_eq!(done["messages"], json!([]));
+    assert_eq!(done["done"], true);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn backfill_discovers_shards_and_rejects_lost_boundaries() {
+    let fixture = Fixture::new("backfill-shards");
+    fixture.add_messages();
+    let path = fixture.db_dir().join("message/message_0.db");
+    let second = fixture.db_dir().join("message/message_1.db");
+    fs::copy(&path, &second).unwrap();
+    let read = |cursor: &str, status| -> Value {
+        serde_json::from_slice(&fixture.invoke(
+            &[
+                "backfill",
+                CHAT,
+                "--since",
+                "1700000000",
+                "--until",
+                "1700000001",
+                "--cursor",
+                cursor,
+                "--limit",
+                "6",
+            ],
+            status,
+        ))
+        .unwrap()
+    };
+    let first = read("", 0);
+    assert_eq!(first["messages"].as_array().unwrap().len(), 6);
+    assert!(first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["shard"] == "message/message_0.db"));
+    assert_eq!(first["done"], false);
+    let third_path = fixture.db_dir().join("message/message_2.db");
+    fs::copy(&path, &third_path).unwrap();
+    let next = read(first["next_cursor"].as_str().unwrap(), 0);
+    assert_eq!(next["messages"].as_array().unwrap().len(), 6);
+    assert!(next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["shard"] == "message/message_1.db"));
+    assert_eq!(next["done"], false);
+    let third = read(next["next_cursor"].as_str().unwrap(), 0);
+    assert_eq!(third["messages"].as_array().unwrap().len(), 6);
+    assert!(third["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["shard"] == "message/message_2.db"));
+    assert_eq!(third["done"], true);
+    let db = Connection::open(third_path).unwrap();
+    db.execute_batch(&format!(
+        "DELETE FROM [Msg_{:x}] WHERE local_id=6",
+        md5::compute(CHAT)
+    ))
+    .unwrap();
+    drop(db);
+    let error = read(third["next_cursor"].as_str().unwrap(), 1);
+    assert_eq!(error["error"]["code"], "CURSOR_OUT_OF_RANGE");
+    fs::remove_file(second).unwrap();
+    let error = read(first["next_cursor"].as_str().unwrap(), 1);
+    assert_eq!(error["error"]["code"], "DB_ROTATED");
 }

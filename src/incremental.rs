@@ -17,6 +17,29 @@ struct Position {
     server_id: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimeWindow {
+    since: i64,
+    until: i64,
+}
+
+impl TimeWindow {
+    pub(crate) fn new(since: i64, until: i64) -> Result<Self> {
+        if since < 0
+            || since >= until
+            || chrono::DateTime::from_timestamp(since, 0).is_none()
+            || chrono::DateTime::from_timestamp(until, 0).is_none()
+        {
+            return Err(reader_error(
+                "TIME_RANGE_INVALID",
+                "since/until 必须是非负有效 Unix 秒，且 since < until",
+            ));
+        }
+        Ok(Self { since, until })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
@@ -26,10 +49,21 @@ struct Cursor {
     chat: String,
     table: String,
     shards: BTreeMap<String, Position>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backfill: Option<TimeWindow>,
 }
 
 impl Cursor {
     fn decode(token: &str, account: &str, chat: &str) -> Result<Self> {
+        Self::decode_for(token, account, chat, None)
+    }
+
+    fn decode_for(
+        token: &str,
+        account: &str,
+        chat: &str,
+        window: Option<TimeWindow>,
+    ) -> Result<Self> {
         let table = format!("Msg_{:x}", md5::compute(chat));
         if token.is_empty() {
             return Ok(Self {
@@ -39,6 +73,7 @@ impl Cursor {
                 chat: chat.into(),
                 table,
                 shards: BTreeMap::new(),
+                backfill: window,
             });
         }
         let invalid = || reader_error("CURSOR_INVALID", "游标格式、版本或字段非法");
@@ -55,6 +90,18 @@ impl Cursor {
                 .any(|p| p.local_id < 0 || (p.local_id > 0) != p.server_id.is_some())
         {
             return Err(invalid());
+        }
+        if cursor.backfill.is_some() != window.is_some() {
+            return Err(reader_error(
+                "CURSOR_KIND_MISMATCH",
+                "补读游标与增量游标不能混用",
+            ));
+        }
+        if cursor.backfill != window {
+            return Err(reader_error(
+                "CURSOR_RANGE_MISMATCH",
+                "补读游标的 since/until 与请求不一致",
+            ));
         }
         if cursor.account != account {
             return Err(reader_error("CURSOR_ACCOUNT_MISMATCH", "游标属于其他账号"));
@@ -339,7 +386,7 @@ pub(crate) fn poll(
     };
     let input = token.or(saved.as_deref()).unwrap_or("");
     let mut cursor = Cursor::decode(input, account, chat)?;
-    let mut shards = open_shards(cfg, &cursor)?;
+    let shards = open_shards(cfg, &cursor)?;
     let replay: Option<String> = transaction
         .query_row(
             "SELECT response FROM batches WHERE chat=?1 AND input=?2 AND page_limit=?3",
@@ -366,6 +413,32 @@ pub(crate) fn poll(
         transaction.commit()?;
         return Ok(response);
     }
+    let (messages, has_more) = read_page(cfg, &mut cursor, shards, limit)?;
+    let next = cursor.encode()?;
+    let response = json!({"account_wxid":account,"chat_wxid":chat,"messages":messages,"next_cursor":next,"has_more":has_more});
+    transaction.execute(
+        "INSERT INTO batches(chat,input,page_limit,response) VALUES(?1,?2,?3,?4)",
+        rusqlite::params![chat, input, limit as i64, serde_json::to_string(&response)?],
+    )?;
+    if token.is_none() {
+        save_checkpoint(&transaction, chat, &next)?;
+    }
+    transaction.commit()?;
+    Ok(response)
+}
+
+/// Shared query, decoding, ordering and generation checks for both read modes.
+fn read_page(
+    cfg: &crate::config::Config,
+    cursor: &mut Cursor,
+    mut shards: BTreeMap<String, Shard>,
+    limit: usize,
+) -> Result<(Vec<Value>, bool)> {
+    let account = cursor.account.as_str();
+    let chat = cursor.chat.as_str();
+    let (since, until) = cursor
+        .backfill
+        .map_or((None, None), |w| (Some(w.since), Some(w.until)));
     let mut messages = Vec::new();
     let mut has_more = false;
     for (rel, shard) in &mut shards {
@@ -381,10 +454,12 @@ pub(crate) fn poll(
         } else {
             "0"
         };
-        let mut stmt = shard.conn.prepare(&format!("SELECT m.local_id, CAST(m.server_id AS TEXT), m.local_type, m.create_time, m.message_content, m.WCDB_CT_message_content, n.user_name, {source}, {compression} FROM [{}] m LEFT JOIN Name2Id n ON n.rowid=m.real_sender_id WHERE m.local_id>?1 ORDER BY m.local_id LIMIT ?2",cursor.table)).map_err(schema_error)?;
+        let mut stmt = shard.conn.prepare(&format!("SELECT m.local_id, CAST(m.server_id AS TEXT), m.local_type, m.create_time, m.message_content, m.WCDB_CT_message_content, n.user_name, {source}, {compression} FROM [{}] m LEFT JOIN Name2Id n ON n.rowid=m.real_sender_id WHERE m.local_id>?1 AND (?3 IS NULL OR (m.create_time>=?3 AND m.create_time<?4)) ORDER BY m.local_id LIMIT ?2",cursor.table)).map_err(schema_error)?;
         let mut rows = stmt.query(rusqlite::params![
             shard.position.local_id,
-            (limit - messages.len() + 1) as i64
+            (limit - messages.len() + 1) as i64,
+            since,
+            until
         ])?;
         while let Some(row) = rows.next()? {
             if messages.len() == limit {
@@ -449,17 +524,28 @@ pub(crate) fn poll(
         .into_iter()
         .map(|(rel, shard)| (rel, shard.position))
         .collect();
-    let next = cursor.encode()?;
-    let response = json!({"account_wxid":account,"chat_wxid":chat,"messages":messages,"next_cursor":next,"has_more":has_more});
-    transaction.execute(
-        "INSERT INTO batches(chat,input,page_limit,response) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![chat, input, limit as i64, serde_json::to_string(&response)?],
-    )?;
-    if token.is_none() {
-        save_checkpoint(&transaction, chat, &next)?;
+    Ok((messages, has_more))
+}
+
+/// Stateless backfill: never opens the incremental checkpoint/batch database.
+pub(crate) fn backfill(
+    cfg: &crate::config::Config,
+    account: &str,
+    chat: &str,
+    window: TimeWindow,
+    token: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    if !(1..=10000).contains(&limit) {
+        return Err(reader_error("INTERNAL", "limit 必须在 1–10000 之间"));
     }
-    transaction.commit()?;
-    Ok(response)
+    let mut cursor = Cursor::decode_for(token.unwrap_or(""), account, chat, Some(window))?;
+    let shards = open_shards(cfg, &cursor)?;
+    let (messages, has_more) = read_page(cfg, &mut cursor, shards, limit)?;
+    Ok(
+        json!({"account_wxid":account,"chat_wxid":chat,"messages":messages,
+        "next_cursor":cursor.encode()?,"has_more":has_more,"done":!has_more}),
+    )
 }
 
 fn verify_generations(cfg: &crate::config::Config, shards: &BTreeMap<String, Shard>) -> Result<()> {

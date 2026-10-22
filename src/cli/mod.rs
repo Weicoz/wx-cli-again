@@ -212,6 +212,22 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "200", value_parser = clap::value_parser!(u32).range(1..=10000))]
         limit: u32,
     },
+    /// 按时间起点补读群消息（固定 JSON，独立游标）
+    Backfill {
+        /// 精确群 wxid
+        chat: String,
+        /// 起点 UTC Unix 秒（含）
+        #[arg(long, allow_hyphen_values = true)]
+        since: i64,
+        /// 终点 UTC Unix 秒（不含）
+        #[arg(long, allow_hyphen_values = true)]
+        until: i64,
+        /// 不透明补读游标；省略或空字符串为首次
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(short = 'n', long, default_value = "200", value_parser = clap::value_parser!(u32).range(1..=10000))]
+        limit: u32,
+    },
     /// 聊天统计分析
     Stats {
         /// 聊天对象名称（支持模糊匹配）
@@ -470,7 +486,7 @@ pub enum DaemonCommands {
 
 pub fn run() {
     let cli = Cli::parse();
-    let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true } | Commands::Incremental { .. });
+    let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true } | Commands::Incremental { .. } | Commands::Backfill { .. });
     if let Err(e) = dispatch(cli) {
         if contract_json {
             println!("{}", account::error_json(&e));
@@ -497,6 +513,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             let wxid = identity["wxid"].as_str().ok_or_else(|| account::reader_error("INTERNAL", "账号身份缺少 wxid"))?;
             let response = crate::incremental::poll(&cfg, wxid, &chat, cursor.as_deref(), limit as usize,
                 &crate::config::cli_dir().join("incremental.db"))?;
+            println!("{}", serde_json::to_string(&response)?);
+            Ok(())
+        },
+        Commands::Backfill { chat, since, until, cursor, limit } => {
+            if crate::config::selected_account().is_none() {
+                return Err(account::reader_error("ACCOUNT_REQUIRED", "backfill 必须用 --wxid 选择账号"));
+            }
+            let (cfg, conn) = account::reader_connection()?;
+            let identity = account::identity(&conn, &cfg.db_dir)?;
+            let wxid = identity["wxid"].as_str().ok_or_else(|| account::reader_error("INTERNAL", "账号身份缺少 wxid"))?;
+            let response = crate::incremental::backfill(&cfg, wxid, &chat, crate::incremental::TimeWindow::new(since, until)?,
+                cursor.as_deref(), limit as usize)?;
             println!("{}", serde_json::to_string(&response)?);
             Ok(())
         },
