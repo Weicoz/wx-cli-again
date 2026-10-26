@@ -1,0 +1,17 @@
+{
+  "accountWxid": "wxid_image_synthetic",
+  "byteLength": null,
+  "chatId": "10001@chatroom",
+  "contractVersion": 1,
+  "convertedFrom": null,
+  "errorCode": "LOCAL_RESOURCE_MISSING",
+  "height": null,
+  "messageId": "9007199254740993002",
+  "mimeType": null,
+  "outputPath": null,
+  "resourceKind": null,
+  "retryable": true,
+  "sha256": null,
+  "status": "unavailable",
+  "width": null
+}

@@ -82,6 +82,25 @@ jobs:
       - name: Build release
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build bundled image codec (Unix)
+        if: matrix.os != 'windows-latest'
+        run: python3 scripts/build-image-codec.py --target ${{ matrix.target }} --install-dir npm/platforms/${{ matrix.npm_dir }}/bin/image-codec
+
+      - uses: msys2/setup-msys2@v2
+        if: matrix.os == 'windows-latest'
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make python
+
+      - name: Build bundled image codec (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: python scripts/build-image-codec.py --target ${{ matrix.target }} --install-dir npm/platforms/${{ matrix.npm_dir }}/bin/image-codec
+
       - name: Copy binary (Unix)
         if: matrix.os != 'windows-latest'
         run: |
@@ -97,6 +116,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path "npm\platforms\${{ matrix.npm_dir }}\bin" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\wx.exe" "npm\platforms\${{ matrix.npm_dir }}\bin\wx.exe"
 
+      - name: Package CLI with image decoder, licenses and corresponding source
+        shell: bash
+        run: python3 -c 'import shutil; shutil.make_archive("wx-image-${{ matrix.target }}", "zip", "npm/platforms/${{ matrix.npm_dir }}/bin")'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wx-image-${{ matrix.target }}
+          path: wx-image-${{ matrix.target }}.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -111,7 +139,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            wx-image-${{ matrix.target }}.zip
 
   publish-npm:
     needs: build
@@ -136,11 +166,11 @@ jobs:
         run: |
           for dir in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             mkdir -p npm/platforms/$dir/bin
-            cp npm-bins/npm-$dir/wx npm/platforms/$dir/bin/wx
+            cp -R npm-bins/npm-$dir/. npm/platforms/$dir/bin/
             chmod +x npm/platforms/$dir/bin/wx
           done
           mkdir -p npm/platforms/win32-x64/bin
-          cp npm-bins/npm-win32-x64/wx.exe npm/platforms/win32-x64/bin/wx.exe
+          cp -R npm-bins/npm-win32-x64/. npm/platforms/win32-x64/bin/
 
       - name: Publish platform packages
         run: |

@@ -1,0 +1,17 @@
+{
+  "accountWxid": "wxid_image_synthetic",
+  "byteLength": 165,
+  "chatId": "10001@chatroom",
+  "contractVersion": 1,
+  "convertedFrom": "wxgf",
+  "errorCode": null,
+  "height": 16,
+  "messageId": "9007199254740993002",
+  "mimeType": "image/png",
+  "outputPath": "<restricted-output-dir>/image.png",
+  "resourceKind": "full_path",
+  "retryable": false,
+  "sha256": "9ba0adf3005cf03e34e4d5db702e53c5e1acd8ab2c4df5a417d37984fef31c97",
+  "status": "ready",
+  "width": 16
+}

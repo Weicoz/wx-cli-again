@@ -61,6 +61,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 按账号及服务端消息 ID 提取最佳本地图片（固定 JSON）
+    Image {
+        #[command(subcommand)]
+        action: ImageAction,
+    },
     /// 当前登录账号身份
     Whoami {
         #[arg(long)]
@@ -484,8 +489,24 @@ pub enum DaemonCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ImageAction {
+    Resolve {
+        chat: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        output_dir: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 pub fn run() {
     let cli = Cli::parse();
+    if let Commands::Image { action: ImageAction::Resolve {chat,message_id,output_dir,..} } = &cli.command {
+        std::process::exit(crate::image::run(cli.wxid.as_deref(),cli.pid,chat,message_id,output_dir));
+    }
     let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true } | Commands::Incremental { .. } | Commands::Backfill { .. });
     if let Err(e) = dispatch(cli) {
         if contract_json {
@@ -502,6 +523,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     let base_with_meta = cli.with_meta;
     let base_debug_source = cli.debug_source;
     match cli.command {
+        Commands::Image {..} => unreachable!("image dispatched before legacy commands"),
         Commands::Whoami { json } => account::cmd_whoami(json),
         Commands::Groups { json } => account::cmd_groups(json),
         Commands::Incremental { chat, cursor, limit } => {

@@ -603,3 +603,15 @@ wx --wxid wxid_example backfill '123@chatroom' --since 1700000000 --until 170259
 补读游标独立携带用途和时间范围，不读写 `incremental.db`。两种游标交叉传入会报 `CURSOR_KIND_MISMATCH`，补读续页改范围报 `CURSOR_RANGE_MISMATCH`。操作端串行安排补读与增量轮次、持久化 next_cursor 并按消息 ID 幂等入库。源库变动时补读不提供增量命令的持久化批次重放保证。
 
 完整参数、JSON 形状、错误码与调度语义见 [补读契约](docs/backfill.md)。真实 CLI 契约样例新增 `tests/fixtures/contract/backfill-first.json`、`backfill-next.json`、`backfill-done.json`，由合成库生成并逐字节比较，原有样例保持不变。
+
+### 按消息读取最佳本地图片（图片契约 v1）
+
+```powershell
+wx --wxid wxid_test_collector image resolve 10001@chatroom --message-id 9007199254740993002 --output-dir D:\restricted-temp\images --json
+```
+
+按精确账号、群和字符串服务端消息 ID 只读定位本地图片，真实解码后选择像素面积最大的可解资源；大图损坏可回退缩略图。成功返回 `status=ready`（exit 0）、随机输出路径、来源、PNG 格式、尺寸、大小、SHA-256 与 `convertedFrom`；不可用返回 `status=unavailable`（exit 2）、固定 `errorCode/retryable`，资源字段均为 null。身份错误 `ACCOUNT_MISMATCH` 应停止该账号任务；数据库/登录故障保留非 0 停读错误，图片 key 缺失不停止文本 incremental。
+
+Windows 图片 key 以 DPAPI CurrentUser + 当前用户目录 ACL 持久化，按账号和规范数据目录隔离，目标反验失败后每请求最多重扫一次，保留最多四个历史版本。WXGF 使用随交付包携带的锁版 FFmpeg 8.0.1 拆封转码，不依赖 PATH 或微信 DLL。图片消费者必须整体携带 `wx[.exe]` 和 `image-codec/`；源码构建后还需执行 `python3 scripts/build-image-codec.py --install-dir target/release/image-codec`。Release 交付使用 `wx-image-<target>.zip`。
+
+六份新增合成契约样例同处 `tests/fixtures/contract/`：`image-regular.json`、`image-thumbnail-fallback.json`、`image-wxgf.json`、`image-key-unavailable.json`、`image-resource-missing.json`、`image-account-mismatch.json`。编排方逐字同步操作端 `tests/fixtures/wx-cli-contract/`。样例只归一化随机输出路径，不含图片字节、key 或客户正文。命令、字段表、依赖清单、测试方式和真机未验证项见 [图片提取契约](docs/image-resolve.md)。
