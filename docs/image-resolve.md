@@ -27,12 +27,14 @@ wx --wxid wxid_test_collector image resolve 10001@chatroom --message-id 90071992
 | convertedFrom | wxgf / gif / png / webp / bmp / tiff 或 null |
 | errorCode | ready 为 null；unavailable 为下表错误码 |
 | retryable | 只对暂态错误为 true；身份错误不能重试吞掉 |
+| stage | 解码失败或 V2 段不完整时增补的可选字段：aes_head / aes_body / pkcs7 / xor_tail / format_detect / wxgf_transcode / image_decode / other；只有阶段码，无异常正文 |
 
 | errorCode | retryable | 含义 |
 | --- | --- | --- |
 | MESSAGE_NOT_READY | true | 消息尚未落盘、服务端 ID 不存在或关联有歧义 |
 | LOCAL_RESOURCE_MISSING | true | 没有该消息确定关联的已落盘资源 |
-| IMAGE_KEY_UNAVAILABLE | false | 图片 key 不可得、DPAPI 不能解封或安全缓存不可写 |
+| IMAGE_KEY_UNAVAILABLE | false | 图片 key 不可得、DPAPI 不能解封或安全缓存不可写；resolve 指定的等待窗口结束后仍无 key 也使用此码 |
+| IMAGE_KEY_HARVEST_TIMEOUT | true | key-harvest 轮询窗口结束仍未完整解码并安全缓存，允许重试 |
 | RESOURCE_INCOMPLETE | true | 文件仍在变化、为空、V2 段长度不足或 WXGF 分区截断 |
 | DECODE_FAILED | false | 已知格式损坏或完整资源不能解码 |
 | FORMAT_UNSUPPORTED | false | 不支持的图片格式/容器布局或超出输入资源上限 |
@@ -44,9 +46,40 @@ wx --wxid wxid_test_collector image resolve 10001@chatroom --message-id 90071992
 
 Windows 使用 DPAPI CurrentUser（不设 LOCAL_MACHINE，禁止交互 UI）保护整个缓存记录，以账号 wxid + 规范化 db_dir 的 SHA-256 作为作用域及 DPAPI entropy。缓存位置为账号应用目录下 `image-keys/<scope>/image-keys.dpapi`，内含记录版本、作用域、验证时间及最多四个历史 key 版本；磁盘只写 DPAPI 密文。目录 DACL 禁止继承，仅当前用户 SID 获得完整权限；文件继承该 ACL。原子替换缓存，并用系统文件锁协调并行 CLI（等锁最多 500ms）。密钥结构不实现 Debug，明文序列化缓冲和 key 在释放时清零。
 
-每次使用先反验目标资源。所有历史版本均不符时，每条 resolve 请求至多扫描一次目标账号主进程（扫描预算 3 秒），不因 PID 变化清空历史版本。目标 V2 长度不足不会扫描；AES 首块已验证、后续体损坏时返回资源错误，不当作 key 失效。对其他图片或旧版本仍可用的 key 保留有界验证能力。不自动打开图片，不退出或重启微信。非 Windows 的新命令不会把 DPAPI 替换成明文文件；加密 V2 返回 IMAGE_KEY_UNAVAILABLE，安全缓存测试使用显式替身。旧 extract 的平台 provider 行为保留。
+每次使用先反验目标资源。所有历史版本均不符时，默认每条 resolve 请求至多扫描一次目标账号主进程（扫描预算 3 秒），不因 PID 变化清空历史版本。可选 `--wait-key-seconds N`（默认 0）将取钥改为有界轮询，扫描之间等待 5000ms，每轮预算至多 30 秒且受剩余等待窗口约束；等待预算由同一请求的候选资源共享。目标 V2 长度不足不会扫描；缓存 key 的 AES 首块已验证、后续体损坏时返回资源错误，不当作 key 失效。扫描所得首块命中只作为候选，必须完成 AES/PKCS7/XOR、真实图片解码（WXGF 还须转码），才写入 DPAPI 缓存；同轮有多个首块命中时依次尝试，直到完整解码成功。缓存命中不重复写盘。对其他图片或旧版本仍可用的 key 保留有界验证能力。不自动打开图片，不退出或重启微信。非 Windows 的新命令不会把 DPAPI 替换成明文文件；加密 V2 返回 IMAGE_KEY_UNAVAILABLE，安全缓存测试使用显式替身。旧 extract 的平台 provider 行为保留。
 
 输出目录必须为绝对路径，不能是链接、源账号数据目录、账号配置目录或这两个目录的祖先；先检查该边界，再创建目录/改 ACL。在 Unix 上新建目录权限 0700，已存在的目录须归当前用户且无 group/other 权限；Windows 应用当前用户专用 DACL。图片以独占创建的随机文件名输出，不覆盖既有文件；操作端负责上传后、取消或崩溃恢复时清理。没有成功候选时不创建明文文件。
+
+## 首次取钥轮询
+
+```powershell
+wx image key-harvest --wxid <账号> --chat <精确群ID> --message-id <字符串服务端消息ID> --interval-ms 5000 --timeout-seconds 300 --json
+wx --wxid <账号> image resolve <精确群ID> --message-id <字符串服务端消息ID> --output-dir D:\restricted-temp\images --wait-key-seconds 60 --json
+```
+
+`key-harvest` 使用该图片消息确定关联的第一个布局完整的本地 V2 资源反验；没有 V2 资源时返回对应资源错误，不从其他消息猜测目标。默认间隔 5000ms、超时 300 秒；间隔必须大于 0。每轮重新选择唯一持有目标数据库的微信主进程，不扫描子进程或 WeChatAppEx。只读 RW/WC/RO/ER（含可执行的可读写/写复制）已提交页，跳过 GUARD/NOACCESS，单区域上限 50MiB，分块 2MiB，重叠 65 字节。每次扫描最多 30 秒，且不能超过轮询剩余时间；同步标准图片解码不能被截止时间抢占。
+
+独立 ASCII32（前 16 字节）、独立 ASCII16、独立 UTF-16LE32（前 16 个字符）参与反验。长 ASCII 串（超过 32 字符）内部的 16 字节窗口只统计，默认绝不反验。每轮共享账号作用域的 `provider.lock`，锁覆盖缓存重读、整轮扫描和缓存写入；单轮等锁最多 500ms，轮询间隔释放锁，其他请求可复用刚写好的缓存。这里的账号作用域沿用账号 + 规范化 db_dir 的散列。轮询间隔从一轮结束后开始计时，超时 0 立即结束取钥窗口。
+
+成功 stdout 为一份 JSON，退出 0，仅含以下五个字段；不可用退出 2，参数/数据库/进程故障退出 1。`--json` 可显式声明，省略时也只输出同样的脱敏 JSON。
+
+```json
+{"status":"ready","attempts":3,"elapsedMs":10000,"candidateCounts":{"ascii32":1,"ascii16":0,"utf16le32":0,"windows":0,"headMatches":1},"cacheWritten":true}
+```
+
+`attempts` 是轮询轮数（含锁争用或缓存检查的轮次）；`elapsedMs` 统计轮询耗时，不含前置数据库/资源定位。`candidateCounts` 的类别数与 `headMatches` 都是本次轮询期间去重后的累计数字：类别按完整候选去重，首块命中按 AES 候选去重；重叠块与跨轮重复不重复计数。同一 AES 候选在一轮内只反验一次，不影响不同轮次重试。成功可能提前停止扫描，计数只代表已观察到的候选。只在内存保留用于去重的哈希，不输出哈希、密钥、候选或内存片段。`cacheWritten=false` 可以表示已有安全缓存对目标完整验证成功，无需重写。
+
+失败时在五个字段外增补 `errorCode`、`retryable`，如有完整解码失败再增补 `stage`。这是为同时表达新错误码及重试属性所作的契约补充；成功五字段不扩展。超时示例：
+
+```json
+{"status":"unavailable","attempts":60,"elapsedMs":300000,"candidateCounts":{"ascii32":0,"ascii16":0,"utf16le32":0,"windows":0,"headMatches":0},"cacheWritten":false,"errorCode":"IMAGE_KEY_HARVEST_TIMEOUT","retryable":true}
+```
+
+没有首块命中属于 key 不可用，不把候选错配误报为资源损坏；完整解码失败只报告最近一次已确认的阶段。轮询耗尽时仍返回可重试的 harvest 超时码，并保留最后的 `stage`（若有）。所有候选失败都不写缓存，不创建明文图片。
+
+首次取钥时，请用户在微信里打开任意一张图片并保持，同时运行 `key-harvest`。账号级密钥在主进程中可能间歇出现，打开图片不保证立即出现。只需成功取钥一次；安全缓存成功后，后续取图不依赖内存中仍有密钥，也不要求持续开图。不自动操作界面、不主动重启微信、不进行网络请求。
+
+本票仅做合成缓冲区、替身和 CLI 测试，**未在 Windows 真机验证**。待现场验证：首次轮询在开图期间取钥、关闭图片后复用缓存、不同 wx.exe 进程及微信重启后的缓存复用（跨进程重启复用）、真实 DPAPI/ACL 与锁争用、真实 V2/WXGF 的完整解码。编排方提供的 Windows 4.1.15.56 间歇命中观察作为实现输入，本票没有重复验证。
 
 ## WXGF 与随包解码依赖
 
@@ -90,7 +123,7 @@ WX_TEST_HEVC=/tmp/wx-synthetic.h265 cargo test --test image_cli -- --include-ign
 rm /tmp/wx-synthetic.h265
 ```
 
-安全缓存测试使用非 Windows 替身覆盖：跨账号/数据目录拒绝、模拟 DPAPI 身份不符、缓存进程重开、目标失效后仅扫描一次、历史版本复用、体损坏不重扫和四版本上限。另有 Windows 专属原生 DPAPI CurrentUser/entropy 往返测试，在非 Windows 不运行。
+安全缓存测试使用非 Windows 替身覆盖：跨账号/数据目录拒绝、模拟 DPAPI 身份不符、缓存进程重开、默认目标失效后仅扫描一次、历史版本复用、体损坏不重扫和四版本上限。新增可注入扫描器/时钟的合成缓冲区测试，覆盖第 k 轮命中、超时、锁争用、多首块误报后继续、UTF-16LE/ASCII 分类与跨轮去重、窗口不反验，以及完整解码后缓存仅写一次、不输出密钥。另有 Windows 专属原生 DPAPI CurrentUser/entropy 往返测试，在非 Windows 不运行。
 
 ## zero-s-pc 现场验收：全部未验证
 

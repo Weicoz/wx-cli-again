@@ -491,12 +491,26 @@ pub enum DaemonCommands {
 
 #[derive(Subcommand)]
 enum ImageAction {
+    KeyHarvest {
+        #[arg(long)]
+        chat: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(1..))]
+        interval_ms: u64,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        json: bool,
+    },
     Resolve {
         chat: String,
         #[arg(long)]
         message_id: String,
         #[arg(long)]
         output_dir: std::path::PathBuf,
+        #[arg(long, default_value_t = 0)]
+        wait_key_seconds: u64,
         #[arg(long)]
         json: bool,
     },
@@ -504,8 +518,14 @@ enum ImageAction {
 
 pub fn run() {
     let cli = Cli::parse();
-    if let Commands::Image { action: ImageAction::Resolve {chat,message_id,output_dir,..} } = &cli.command {
-        std::process::exit(crate::image::run(cli.wxid.as_deref(),cli.pid,chat,message_id,output_dir));
+    if let Commands::Image { action } = &cli.command {
+        let exit = match action {
+            ImageAction::Resolve { chat, message_id, output_dir, wait_key_seconds, .. } =>
+                crate::image::run(cli.wxid.as_deref(), cli.pid, chat, message_id, output_dir, *wait_key_seconds),
+            ImageAction::KeyHarvest { chat, message_id, interval_ms, timeout_seconds, .. } =>
+                crate::image::run_harvest(cli.wxid.as_deref(), cli.pid, chat, message_id, *interval_ms, *timeout_seconds),
+        };
+        std::process::exit(exit);
     }
     let contract_json = matches!(cli.command, Commands::Whoami { json: true } | Commands::Groups { json: true } | Commands::Incremental { .. } | Commands::Backfill { .. });
     if let Err(e) = dispatch(cli) {

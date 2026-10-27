@@ -1,5 +1,5 @@
 //! WXGF 仅接受有边界的 length-prefixed Annex B 分区，不把容器尾部当裸流。
-use super::Failure;
+use super::{Failure, Stage};
 use image::{AnimationDecoder, ImageDecoder, ImageFormat, ImageReader};
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +21,25 @@ pub(super) struct StandardImage {
 }
 
 pub(super) fn standard(data: &[u8], deadline: Instant) -> Result<StandardImage, Failure> {
+    standard_with(data, deadline, &mut transcode)
+}
+fn standard_with(
+    data: &[u8],
+    deadline: Instant,
+    transcode: &mut impl FnMut(&[u8], Instant) -> Result<Vec<u8>, Failure>,
+) -> Result<StandardImage, Failure> {
+    standard_inner(data, deadline, transcode).map_err(|failure| match failure {
+        Failure::FormatUnsupported => Failure::Stage(Stage::FormatDetect),
+        Failure::DecodeFailed => Failure::Stage(Stage::ImageDecode),
+        Failure::TranscodeFailed => Failure::Stage(Stage::WxgfTranscode),
+        f => f,
+    })
+}
+fn standard_inner(
+    data: &[u8],
+    deadline: Instant,
+    transcode: &mut impl FnMut(&[u8], Instant) -> Result<Vec<u8>, Failure>,
+) -> Result<StandardImage, Failure> {
     if data.len() > MAX_BYTES {
         return Err(Failure::DecodeFailed);
     }
@@ -371,6 +390,15 @@ mod tests {
     fn wxgf_rejects_missing_parameter_sets_and_fake_start_codes() {
         assert!(partitions(&wrap(&[0, 0, 1, 38, 1, 0x80])).is_err());
         assert!(partitions(b"wxgfgarbage\0\0\0\x01").is_err());
+    }
+    #[test]
+    fn synthetic_wxgf_transcode_failure_has_stage() {
+        let result = standard_with(
+            &wrap(&stream()),
+            Instant::now() + Duration::from_secs(1),
+            &mut |_, _| Err(Failure::TranscodeFailed),
+        );
+        assert_eq!(result.err(), Some(Failure::Stage(Stage::WxgfTranscode)));
     }
     #[test]
     fn expired_codec_budget_returns_timeout() {

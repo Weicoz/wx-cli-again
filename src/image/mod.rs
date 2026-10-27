@@ -1,4 +1,5 @@
 mod codec;
+pub(crate) mod harvest;
 mod key_cache;
 mod secure_fs;
 
@@ -13,6 +14,21 @@ pub(crate) enum Failure {
     TranscodeFailed,
     AccountMismatch,
     Timeout,
+    HarvestTimeout,
+    Stage(Stage),
+    Incomplete(Stage),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Stage {
+    AesHead,
+    AesBody,
+    Pkcs7,
+    XorTail,
+    FormatDetect,
+    WxgfTranscode,
+    ImageDecode,
+    Other,
 }
 impl Failure {
     fn code(self) -> &'static str {
@@ -20,12 +36,16 @@ impl Failure {
             Self::MessageNotReady => "MESSAGE_NOT_READY",
             Self::LocalResourceMissing => "LOCAL_RESOURCE_MISSING",
             Self::ImageKeyUnavailable => "IMAGE_KEY_UNAVAILABLE",
-            Self::ResourceIncomplete => "RESOURCE_INCOMPLETE",
+            Self::ResourceIncomplete | Self::Incomplete(_) => "RESOURCE_INCOMPLETE",
             Self::DecodeFailed => "DECODE_FAILED",
             Self::FormatUnsupported => "FORMAT_UNSUPPORTED",
             Self::TranscodeFailed => "TRANSCODE_FAILED",
             Self::AccountMismatch => "ACCOUNT_MISMATCH",
             Self::Timeout => "TIMEOUT",
+            Self::HarvestTimeout => "IMAGE_KEY_HARVEST_TIMEOUT",
+            Self::Stage(Stage::FormatDetect) => "FORMAT_UNSUPPORTED",
+            Self::Stage(Stage::WxgfTranscode) => "TRANSCODE_FAILED",
+            Self::Stage(_) => "DECODE_FAILED",
         }
     }
     fn retryable(self) -> bool {
@@ -34,7 +54,9 @@ impl Failure {
             Self::MessageNotReady
                 | Self::LocalResourceMissing
                 | Self::ResourceIncomplete
+                | Self::Incomplete(_)
                 | Self::Timeout
+                | Self::HarvestTimeout
         )
     }
 }
@@ -68,6 +90,8 @@ struct Response {
     converted_from: Option<&'static str>,
     error_code: Option<&'static str>,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<Stage>,
 }
 impl Response {
     fn new(account: &str, chat: &str, message: &str) -> Self {
@@ -87,9 +111,16 @@ impl Response {
             converted_from: None,
             error_code: None,
             retryable: false,
+            stage: None,
         }
     }
     fn failed(mut self, f: Failure) -> Self {
+        self.stage = match f {
+            Failure::Stage(stage) | Failure::Incomplete(stage) => Some(stage),
+            Failure::DecodeFailed => Some(Stage::Other),
+            Failure::TranscodeFailed => Some(Stage::WxgfTranscode),
+            _ => None,
+        };
         self.error_code = Some(f.code());
         self.retryable = f.retryable();
         self
@@ -103,8 +134,9 @@ pub(crate) fn run(
     chat: &str,
     message: &str,
     output: &Path,
+    wait_key_seconds: u64,
 ) -> i32 {
-    match resolve(account_id, pid, chat, message, output) {
+    match resolve(account_id, pid, chat, message, output, wait_key_seconds) {
         Ok(response) => {
             let exit = if response.status == "ready" { 0 } else { 2 };
             println!(
@@ -126,15 +158,90 @@ pub(crate) fn run(
         }
     }
 }
-fn resolve(
+/// harvest 输出不带请求身份、路径或异常正文，只报告统计和结构化失败字段。
+pub(crate) fn run_harvest(
     account_id: Option<&str>,
     pid: Option<u32>,
     chat: &str,
     message: &str,
-    output: &Path,
-) -> Result<Response> {
+    interval_ms: u64,
+    timeout_seconds: u64,
+) -> i32 {
+    let mut report = harvest::Report::default();
+    let result = harvest_target(
+        account_id,
+        pid,
+        chat,
+        message,
+        interval_ms,
+        timeout_seconds,
+        &mut report,
+    );
+    let exit = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            if let Some(f) = e.downcast_ref::<Failure>() {
+                report.failed(*f);
+                2
+            } else {
+                report.status = "unavailable".into();
+                report.error_code = Some(
+                    e.downcast_ref::<account::ReaderError>()
+                        .map_or("PROCESS_FAILED", |e| e.code)
+                        .into(),
+                );
+                report.retryable = Some(false);
+                1
+            }
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&report).expect("serializable report")
+    );
+    exit
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
+}
+impl std::error::Error for Failure {}
+fn harvest_target(
+    account_id: Option<&str>,
+    pid: Option<u32>,
+    chat: &str,
+    message: &str,
+    interval_ms: u64,
+    timeout_seconds: u64,
+    report: &mut harvest::Report,
+) -> Result<()> {
     let account_id = account_id.ok_or_else(|| anyhow!("需要 --wxid"))?;
     config::select_account(Some(account_id), pid)?;
+    validate_request(chat, message)?;
+    let cfg = image_account(account_id)?;
+    let (local, time) = locate_message(&cfg, chat, message)?.ok_or(Failure::MessageNotReady)?;
+    let md5 = resource_md5(&cfg, chat, local, time)?.ok_or(Failure::LocalResourceMissing)?;
+    let mut target_failure = Failure::LocalResourceMissing;
+    for candidate in candidates(&cfg.db_dir, chat, &md5)? {
+        match read_candidate(&candidate.path) {
+            Ok(dat) if dat.starts_with(&decoder::V2_MAGIC) => {
+                match key_cache::validate_target(&dat) {
+                    Ok(()) => {
+                        let mut provider = key_cache::Provider::new(account_id, &cfg.db_dir)?;
+                        provider.poll(&dat, timeout_seconds, interval_ms, true, report)?;
+                        return Ok(());
+                    }
+                    Err(e) => target_failure = e,
+                }
+            }
+            Ok(_) => target_failure = Failure::FormatUnsupported,
+            Err(e) => target_failure = e,
+        }
+    }
+    Err(target_failure.into())
+}
+fn validate_request(chat: &str, message: &str) -> Result<()> {
     anyhow::ensure!(
         chat.ends_with("@chatroom")
             && chat.len() <= 256
@@ -150,14 +257,9 @@ fn resolve(
             && message != "0",
         "需要字符串服务端消息 ID"
     );
-    anyhow::ensure!(
-        output.is_absolute()
-            && !output
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir)),
-        "输出目录必须为绝对受限目录"
-    );
-    let response = Response::new(account_id, chat, message);
+    Ok(())
+}
+fn image_account(account_id: &str) -> Result<config::Config> {
     let config_path = config::find_config_file()?;
     if config_path.exists() {
         let raw: Value = serde_json::from_slice(&std::fs::read(config_path)?)?;
@@ -166,7 +268,7 @@ fn resolve(
             .and_then(Value::as_str)
             .is_some_and(|p| !config::account_matches_dir(account_id, Path::new(p)))
         {
-            return Ok(response.failed(Failure::AccountMismatch));
+            return Err(Failure::AccountMismatch.into());
         }
     }
     let (cfg, contact) = account::reader_connection()?;
@@ -176,9 +278,39 @@ fn resolve(
         |r| r.get(0),
     )?;
     if !self_exists {
-        return Ok(response.failed(Failure::AccountMismatch));
+        return Err(Failure::AccountMismatch.into());
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    Ok(cfg)
+}
+fn resolve(
+    account_id: Option<&str>,
+    pid: Option<u32>,
+    chat: &str,
+    message: &str,
+    output: &Path,
+    wait_key_seconds: u64,
+) -> Result<Response> {
+    let account_id = account_id.ok_or_else(|| anyhow!("需要 --wxid"))?;
+    config::select_account(Some(account_id), pid)?;
+    validate_request(chat, message)?;
+    anyhow::ensure!(
+        output.is_absolute()
+            && !output
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "输出目录必须为绝对受限目录"
+    );
+    let response = Response::new(account_id, chat, message);
+    let cfg = match image_account(account_id) {
+        Ok(cfg) => cfg,
+        Err(e) if e.downcast_ref::<Failure>() == Some(&Failure::AccountMismatch) => {
+            return Ok(response.failed(Failure::AccountMismatch))
+        }
+        Err(e) => return Err(e),
+    };
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(10u64.saturating_add(wait_key_seconds)))
+        .ok_or_else(|| anyhow!("等待时间超出范围"))?;
     let target = locate_message(&cfg, chat, message)?;
     let Some((local, time)) = target else {
         return Ok(response.failed(Failure::MessageNotReady));
@@ -201,7 +333,7 @@ fn resolve(
         let decoded = read_candidate(&c.path)
             .and_then(|dat| {
                 if dat.starts_with(&decoder::V2_MAGIC) {
-                    provider.decode(&dat)
+                    provider.decode_wait(&dat, wait_key_seconds)
                 } else if dat.starts_with(&decoder::V1_MAGIC) {
                     if dat.len() < 31 {
                         return Err(Failure::ResourceIncomplete);
@@ -299,10 +431,11 @@ fn projected_output(path: &Path) -> Result<PathBuf> {
 fn failure_priority(f: Failure) -> u8 {
     match f {
         Failure::LocalResourceMissing => 0,
-        Failure::FormatUnsupported => 1,
+        Failure::FormatUnsupported | Failure::Stage(Stage::FormatDetect) => 1,
         Failure::DecodeFailed => 2,
-        Failure::TranscodeFailed => 3,
-        Failure::ResourceIncomplete => 4,
+        Failure::TranscodeFailed | Failure::Stage(Stage::WxgfTranscode) => 3,
+        Failure::Stage(_) => 2,
+        Failure::ResourceIncomplete | Failure::Incomplete(_) => 4,
         Failure::ImageKeyUnavailable => 5,
         Failure::Timeout => 6,
         _ => 7,

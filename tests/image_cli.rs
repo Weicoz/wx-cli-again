@@ -86,6 +86,9 @@ impl Fixture {
         .unwrap();
     }
     fn invoke(&self, chat: &str, message: &str) -> (i32, Value) {
+        self.invoke_with(chat, message, &[])
+    }
+    fn invoke_with(&self, chat: &str, message: &str, extra: &[&str]) -> (i32, Value) {
         let executable =
             std::env::var_os("WX_TEST_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_wx").into());
         let out = Command::new(executable)
@@ -111,6 +114,7 @@ impl Fixture {
             ])
             .arg(self.root.join("output"))
             .arg("--json")
+            .args(extra)
             .output()
             .unwrap();
         assert!(out.stderr.is_empty(), "diagnostics must be sanitized");
@@ -244,6 +248,7 @@ fn image_truncated_container_is_retryable_not_a_key_error() {
     assert_eq!(exit, 2);
     assert_eq!(v["errorCode"], "RESOURCE_INCOMPLETE");
     assert_eq!(v["retryable"], true);
+    assert_eq!(v["stage"], "aes_head");
 }
 #[test]
 fn image_equal_area_prefers_full_path_and_never_fuzzy_matches_chat() {
@@ -321,4 +326,109 @@ fn image_resource_join_rejects_cross_shard_local_id_collision() {
     let (exit, v) = f.invoke(CHAT, MESSAGE);
     assert_eq!(exit, 2);
     assert_eq!(v["errorCode"], "MESSAGE_NOT_READY");
+}
+
+#[test]
+fn image_wait_key_flag_preserves_ready_contract() {
+    let f = Fixture::new("wait-ready");
+    f.png("", 2, 2);
+    let (exit, v) = f.invoke_with(CHAT, MESSAGE, &["--wait-key-seconds", "1"]);
+    assert_eq!(exit, 0);
+    assert_eq!(v["status"], "ready");
+    assert!(v.get("stage").is_none());
+}
+#[test]
+fn image_decode_failure_adds_sanitized_stage() {
+    let f = Fixture::new("stage");
+    fs::write(
+        f.img().join(format!("{MD5}.dat")),
+        b"\x89PNG\r\n\x1a\nsynthetic",
+    )
+    .unwrap();
+    let (exit, v) = f.invoke(CHAT, MESSAGE);
+    assert_eq!(exit, 2);
+    assert_eq!(v["errorCode"], "DECODE_FAILED");
+    assert_eq!(v["stage"], "image_decode");
+    assert!(!f.root.join("output").exists());
+    // 旧 V1 decoder 的未细分异常也必须只有阶段码，不输出异常正文。
+    let mut dat = b"\x07\x08V1\x08\x07".to_vec();
+    dat.extend_from_slice(&16u32.to_le_bytes());
+    dat.extend_from_slice(&0u32.to_le_bytes());
+    dat.push(0);
+    dat.extend_from_slice(&[0; 32]);
+    fs::write(f.img().join(format!("{MD5}.dat")), dat).unwrap();
+    let (exit, v) = f.invoke(CHAT, MESSAGE);
+    assert_eq!(exit, 2);
+    assert_eq!(v["errorCode"], "DECODE_FAILED");
+    assert_eq!(v["stage"], "other");
+}
+#[test]
+fn image_harvest_timeout_json_never_includes_identity_paths_or_candidates() {
+    let f = Fixture::new("harvest-timeout");
+    let mut dat = b"\x07\x08V2\x08\x07".to_vec();
+    dat.extend_from_slice(&16u32.to_le_bytes());
+    dat.extend_from_slice(&0u32.to_le_bytes());
+    dat.push(0);
+    dat.extend_from_slice(&[0; 32]);
+    fs::write(f.img().join(format!("{MD5}.dat")), dat).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_wx"))
+        .env("WX_CLI_HOME", &f.root)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", f.root.join("bin").display()),
+        )
+        .env_remove("WX_DAEMON_MODE")
+        .env_remove("WX_ACCOUNT")
+        .env_remove("WX_PID")
+        .args([
+            "image",
+            "key-harvest",
+            "--wxid",
+            ACCOUNT,
+            "--pid",
+            "4242",
+            "--chat",
+            CHAT,
+            "--message-id",
+            MESSAGE,
+            "--interval-ms",
+            "1",
+            "--timeout-seconds",
+            "0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "unavailable");
+    assert_eq!(v["errorCode"], "IMAGE_KEY_HARVEST_TIMEOUT");
+    assert_eq!(v["retryable"], true);
+    let names: std::collections::HashSet<_> =
+        v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        std::collections::HashSet::from([
+            "status",
+            "attempts",
+            "elapsedMs",
+            "candidateCounts",
+            "cacheWritten",
+            "errorCode",
+            "retryable"
+        ])
+    );
+    assert!(v["candidateCounts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(Value::is_u64));
+    assert_eq!(v["cacheWritten"], false);
+    assert!(!out
+        .stdout
+        .windows(ACCOUNT.len())
+        .any(|b| b == ACCOUNT.as_bytes()));
+    assert!(!f.root.join("output").exists());
+    assert!(!f.profile().join("image-keys").exists());
 }

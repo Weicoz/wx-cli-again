@@ -1,4 +1,4 @@
-//! 单次请求最多扫描一次；历史版本仅对当前目标反验，不按 PID 清空。
+//! DPAPI 缓存与轮询：完整解码成功后才持久化新 key；每轮持有同一账号锁。
 #![cfg_attr(not(any(windows, test)), allow(dead_code))]
 use super::Failure;
 use crate::attachment::decoder::{self, V2_MAGIC};
@@ -23,85 +23,27 @@ trait Vault {
     fn save(&mut self, scope: &str, keys: &[Key]) -> Result<(), Failure>;
 }
 
+pub(super) fn validate_target(dat: &[u8]) -> Result<(), Failure> {
+    validate_layout(dat)
+}
 fn validate_layout(dat: &[u8]) -> Result<(), Failure> {
     if !dat.starts_with(&V2_MAGIC) {
         return Err(Failure::FormatUnsupported);
     }
-    if dat.len() < 15 {
-        return Err(Failure::ResourceIncomplete);
+    if dat.len() < 31 {
+        return Err(Failure::Incomplete(Stage::AesHead));
     }
     let size = u32::from_le_bytes(dat[6..10].try_into().unwrap()) as u64;
     let xor = u32::from_le_bytes(dat[10..14].try_into().unwrap()) as u64;
-    let needed = 15 + size + (16 - size % 16) + xor;
-    if needed > dat.len() as u64 {
-        return Err(Failure::ResourceIncomplete);
+    let aes_end = 15 + size + (16 - size % 16);
+    if aes_end > dat.len() as u64 {
+        return Err(Failure::Incomplete(Stage::AesBody));
+    }
+    if aes_end + xor > dat.len() as u64 {
+        return Err(Failure::Incomplete(Stage::XorTail));
     }
     Ok(())
 }
-// AES 首块已识别时，后续损坏属于资源错误，不再把它当 key 失效。
-fn open(dat: &[u8], key: &Key) -> Result<Option<Vec<u8>>, Failure> {
-    use aes::cipher::{BlockDecrypt, KeyInit};
-    let aes = aes::Aes128::new((&key.aes).into());
-    let mut first = aes::cipher::generic_array::GenericArray::clone_from_slice(&dat[15..31]);
-    aes.decrypt_block(&mut first);
-    if decoder::detect_image_format(&first) == "bin" {
-        // 对未知格式验证整个 AES 段的 PKCS7，避免已知历史 key 因不支持格式而被重扫。
-        let size = u32::from_le_bytes(dat[6..10].try_into().unwrap()) as usize;
-        let aligned = size + (16 - size % 16);
-        let mut plain = zeroize::Zeroizing::new(dat[15..15 + aligned].to_vec());
-        for b in plain.as_chunks_mut::<16>().0.iter_mut() {
-            aes.decrypt_block(b.into());
-        }
-        let pad = *plain.last().unwrap() as usize;
-        if pad > 0
-            && pad <= 16
-            && pad <= plain.len()
-            && plain[plain.len() - pad..]
-                .iter()
-                .all(|&b| b as usize == pad)
-            && plain.len() - pad == size
-        {
-            return Err(Failure::FormatUnsupported);
-        }
-        return Ok(None);
-    }
-    decoder::dispatch(
-        dat,
-        decoder::V2KeyMaterial {
-            aes_key: Some(&key.aes),
-            xor_key: key.xor,
-        },
-    )
-    .map(|d| Some(d.data))
-    .map_err(|_| Failure::DecodeFailed)
-}
-fn decode(
-    dat: &[u8],
-    scope: &str,
-    vault: &mut impl Vault,
-    scan: &mut impl FnMut(&[u8]) -> Result<Key, Failure>,
-) -> Result<Vec<u8>, Failure> {
-    validate_layout(dat)?;
-    let mut keys = vault.load(scope)?;
-    for i in 0..keys.len() {
-        if let Some(data) = open(dat, &keys[i])? {
-            let mut verified = keys.remove(i);
-            verified.validated_at = chrono::Utc::now().timestamp();
-            keys.insert(0, verified);
-            vault.save(scope, &keys)?;
-            return Ok(data);
-        }
-    }
-    let mut key = scan(dat)?;
-    let data = open(dat, &key)?.ok_or(Failure::ImageKeyUnavailable)?;
-    key.validated_at = chrono::Utc::now().timestamp();
-    keys.retain(|k| k.aes != key.aes || k.xor != key.xor);
-    keys.insert(0, key);
-    keys.truncate(4);
-    vault.save(scope, &keys)?;
-    Ok(data)
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Record {
     version: u32,
@@ -166,6 +108,7 @@ pub(super) struct Provider {
     scope: String,
     db_dir: PathBuf,
     scanned: bool,
+    wait_deadline: Option<Instant>,
 }
 impl Provider {
     pub fn new(account: &str, db_dir: &Path) -> anyhow::Result<Self> {
@@ -178,79 +121,357 @@ impl Provider {
             scope,
             db_dir,
             scanned: false,
+            wait_deadline: None,
         })
     }
-    pub fn decode(&mut self, dat: &[u8]) -> Result<Vec<u8>, Failure> {
-        validate_layout(dat)?;
-        #[cfg(windows)]
-        {
-            let dir = super::secure_fs::private_dir(
-                &crate::config::cli_dir()
-                    .join("image-keys")
-                    .join(&self.scope),
-            )
-            .map_err(|_| Failure::ImageKeyUnavailable)?;
-            let lock_path = dir.join("provider.lock");
-            if lock_path.exists()
-                && super::secure_fs::is_link(&lock_path)
-                    .map_err(|_| Failure::ImageKeyUnavailable)?
-            {
-                return Err(Failure::ImageKeyUnavailable);
-            }
-            let lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(lock_path)
-                .map_err(|_| Failure::ImageKeyUnavailable)?;
-            let wait_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            loop {
-                match lock.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock)
-                        if std::time::Instant::now() < wait_until =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10))
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => return Err(Failure::Timeout),
-                    Err(_) => return Err(Failure::ImageKeyUnavailable),
+    pub fn decode_wait(&mut self, dat: &[u8], wait_seconds: u64) -> Result<Vec<u8>, Failure> {
+        let mut report = super::harvest::Report::default();
+        let remaining = if wait_seconds > 0 {
+            let deadline = match self.wait_deadline {
+                Some(deadline) => deadline,
+                None => {
+                    let deadline = Instant::now()
+                        .checked_add(Duration::from_secs(wait_seconds))
+                        .ok_or(Failure::Timeout)?;
+                    self.wait_deadline = Some(deadline);
+                    deadline
                 }
-            }
-            let mut vault = ProtectedVault {
-                dir,
-                protector: Dpapi,
             };
-            decode(dat, &self.scope, &mut vault, &mut |target| {
-                if self.scanned {
-                    return Err(Failure::ImageKeyUnavailable);
+            deadline.saturating_duration_since(Instant::now())
+        } else {
+            Duration::ZERO
+        };
+        self.poll_for(dat, remaining, 5000, false, &mut report)
+    }
+    pub fn poll(
+        &mut self,
+        dat: &[u8],
+        seconds: u64,
+        interval_ms: u64,
+        harvest: bool,
+        report: &mut super::harvest::Report,
+    ) -> Result<Vec<u8>, Failure> {
+        self.poll_for(
+            dat,
+            Duration::from_secs(seconds),
+            interval_ms,
+            harvest,
+            report,
+        )
+    }
+    fn poll_for(
+        &mut self,
+        dat: &[u8],
+        wait: Duration,
+        interval_ms: u64,
+        harvest: bool,
+        report: &mut super::harvest::Report,
+    ) -> Result<Vec<u8>, Failure> {
+        validate_layout(dat)?;
+        let budget = if harvest || !wait.is_zero() { 30 } else { 3 };
+        let allow_scan = (harvest || !self.scanned || !wait.is_zero())
+            && (harvest || self.wait_deadline.is_none_or(|d| Instant::now() < d));
+        let mut scanner = super::harvest::NativeScanner {
+            db_dir: &self.db_dir,
+            scanned: false,
+        };
+        let result = poll(
+            &mut super::harvest::SystemClock,
+            wait,
+            interval_ms,
+            budget,
+            harvest,
+            report,
+            &mut |deadline, candidates| {
+                #[cfg(windows)]
+                {
+                    let dir = super::secure_fs::private_dir(
+                        &crate::config::cli_dir()
+                            .join("image-keys")
+                            .join(&self.scope),
+                    )
+                    .map_err(|_| Failure::ImageKeyUnavailable)?;
+                    let _lock = provider_lock(&dir, deadline)?;
+                    let mut vault = ProtectedVault {
+                        dir,
+                        protector: Dpapi,
+                    };
+                    attempt(
+                        dat,
+                        &self.scope,
+                        &mut vault,
+                        &mut scanner,
+                        deadline,
+                        candidates,
+                        allow_scan,
+                    )
                 }
-                self.scanned = true;
-                let k =
-                    crate::attachment::image_key::windows::scan_for_target(&self.db_dir, target)
-                        .map_err(|e| {
-                            if e.downcast_ref::<crate::cli::account::ReaderError>()
-                                .is_some_and(|e| e.code == "TIMEOUT")
-                            {
-                                Failure::Timeout
-                            } else {
-                                Failure::ImageKeyUnavailable
-                            }
-                        })?;
-                Ok(Key {
-                    aes: k.aes_key,
-                    xor: k.xor_key,
-                    validated_at: 0,
-                })
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            // 非 Windows 不做不安全的磁盘替代；真实 DPAPI 仅在 Windows 启用。
-            let _ = (&self.scope, &self.db_dir, self.scanned);
-            Err(Failure::ImageKeyUnavailable)
+                #[cfg(not(windows))]
+                {
+                    let _ = (&self.scope, &mut scanner, deadline, candidates, allow_scan);
+                    scanner.scanned = true;
+                    Err(Failure::ImageKeyUnavailable)
+                }
+            },
+        );
+        self.scanned |= scanner.scanned;
+        result
+    }
+}
+
+/// 同账号的锁在缓存读取、整个扫描和缓存原子替换期间一直持有。
+fn provider_lock(dir: &Path, deadline: std::time::Instant) -> Result<std::fs::File, Failure> {
+    let path = dir.join("provider.lock");
+    if path.exists()
+        && super::secure_fs::is_link(&path).map_err(|_| Failure::ImageKeyUnavailable)?
+    {
+        return Err(Failure::ImageKeyUnavailable);
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|_| Failure::ImageKeyUnavailable)?;
+    let until = deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(Failure::Timeout),
+            Err(_) => return Err(Failure::ImageKeyUnavailable),
         }
     }
+}
+
+use super::{
+    harvest::{Candidates, Clock, Report, Scanner},
+    Stage,
+};
+use std::time::{Duration, Instant};
+
+#[allow(clippy::too_many_arguments)]
+fn poll(
+    clock: &mut impl Clock,
+    wait: Duration,
+    interval_ms: u64,
+    budget: u64,
+    harvest: bool,
+    report: &mut Report,
+    attempt: &mut impl FnMut(Instant, &mut Candidates) -> Result<(Vec<u8>, bool), Failure>,
+) -> Result<Vec<u8>, Failure> {
+    let start = clock.now();
+    let end = start.checked_add(wait).ok_or(Failure::Timeout)?;
+    let mut candidates = Candidates::default();
+    let result = loop {
+        if report.attempts > 0 && clock.now() >= end {
+            break Err(if harvest {
+                Failure::HarvestTimeout
+            } else if let Some(stage) = report.stage {
+                Failure::Stage(stage)
+            } else {
+                Failure::ImageKeyUnavailable
+            });
+        }
+        report.attempts += 1;
+        let deadline = clock
+            .now()
+            .checked_add(Duration::from_secs(budget))
+            .ok_or(Failure::Timeout)?;
+        let deadline = if wait.is_zero() && !harvest {
+            deadline
+        } else {
+            deadline.min(end)
+        };
+        match attempt(deadline, &mut candidates) {
+            Ok((data, written)) => {
+                report.cache_written = written;
+                break Ok(data);
+            }
+            Err(Failure::Stage(stage)) => {
+                report.stage = Some(stage);
+            }
+            Err(Failure::Timeout) if wait.is_zero() && !harvest => break Err(Failure::Timeout),
+            Err(Failure::ImageKeyUnavailable | Failure::Timeout) => {}
+            Err(e) => break Err(e),
+        }
+        if wait.is_zero() || clock.now() >= end {
+            break Err(if harvest {
+                Failure::HarvestTimeout
+            } else if let Some(stage) = report.stage {
+                Failure::Stage(stage)
+            } else {
+                Failure::ImageKeyUnavailable
+            });
+        }
+        clock.sleep(
+            Duration::from_millis(interval_ms.max(1))
+                .min(end.saturating_duration_since(clock.now())),
+        );
+    };
+    report.elapsed_ms = clock
+        .now()
+        .duration_since(start)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    report.candidate_counts = candidates.counts;
+    match result {
+        Ok(_) => report.status = "ready".into(),
+        Err(e) => report.failed(e),
+    }
+    if result.is_ok() {
+        report.stage = None;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attempt(
+    dat: &[u8],
+    scope: &str,
+    vault: &mut impl Vault,
+    scanner: &mut impl Scanner,
+    deadline: Instant,
+    candidates: &mut Candidates,
+    allow_scan: bool,
+) -> Result<(Vec<u8>, bool), Failure> {
+    validate_layout(dat)?;
+    let mut keys = vault.load(scope)?;
+    for key in &keys {
+        if let Some(data) = open_complete(dat, key, deadline)? {
+            return Ok((data, false));
+        }
+    }
+    if !allow_scan {
+        return Err(Failure::ImageKeyUnavailable);
+    }
+    let mut success = None;
+    let mut last = Failure::ImageKeyUnavailable;
+    let mut heads = Vec::new();
+    let scan_result = scanner.scan(dat, deadline, candidates, &mut |mut aes| {
+        use aes::cipher::{BlockDecrypt, KeyInit};
+        let cipher = aes::Aes128::new((&aes).into());
+        let mut first = aes::cipher::generic_array::GenericArray::clone_from_slice(&dat[15..31]);
+        cipher.decrypt_block(&mut first);
+        let format = decoder::detect_image_format(&first);
+        if format == "bin" {
+            aes.zeroize();
+            return false;
+        }
+        heads.push(sha2::Sha256::digest(aes).into());
+        let xor = match infer_xor(dat, format) {
+            Ok(xor) => xor,
+            Err(e) => {
+                last = e;
+                aes.zeroize();
+                return false;
+            }
+        };
+        let key = Key {
+            aes,
+            xor,
+            validated_at: chrono::Utc::now().timestamp(),
+        };
+        aes.zeroize();
+        match open_complete(dat, &key, deadline) {
+            Ok(Some(data)) => {
+                success = Some((key, data));
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                last = e;
+                false
+            }
+        }
+    });
+    for hash in heads {
+        candidates.head_hash(hash);
+    }
+    if let Some((key, data)) = success {
+        keys.retain(|k| k.aes != key.aes || k.xor != key.xor);
+        keys.insert(0, key);
+        keys.truncate(4);
+        vault.save(scope, &keys)?;
+        return Ok((data, true));
+    }
+    // 即使扫描预算耗尽，也保留已经确定的完整解码阶段。
+    if last != Failure::ImageKeyUnavailable {
+        return Err(last);
+    }
+    scan_result?;
+    Err(Failure::ImageKeyUnavailable)
+}
+
+fn infer_xor(dat: &[u8], format: &str) -> Result<u8, Failure> {
+    let footer: &[u8] = match format {
+        "jpg" => &[0xff, 0xd9],
+        "png" => &[0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82],
+        "gif" => &[0x3b],
+        _ => &[],
+    };
+    let count = (u32::from_le_bytes(dat[10..14].try_into().unwrap()) as usize).min(footer.len());
+    if count == 0 {
+        return Ok(0x88);
+    }
+    let xor = dat[dat.len() - 1] ^ footer[footer.len() - 1];
+    if !dat[dat.len() - count..]
+        .iter()
+        .zip(&footer[footer.len() - count..])
+        .all(|(a, b)| a ^ b == xor)
+    {
+        return Err(Failure::Stage(Stage::XorTail));
+    }
+    Ok(xor)
+}
+
+fn open_complete(dat: &[u8], key: &Key, deadline: Instant) -> Result<Option<Vec<u8>>, Failure> {
+    let Some(data) = open_staged(dat, key)? else {
+        return Ok(None);
+    };
+    // 标准图片的完整解码与 WXGF 转码均须成功，才允许把新 key 写进缓存。
+    super::codec::standard(&data, deadline)?;
+    Ok(Some(data))
+}
+fn open_staged(dat: &[u8], key: &Key) -> Result<Option<Vec<u8>>, Failure> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    validate_layout(dat)?;
+    let cipher = aes::Aes128::new((&key.aes).into());
+    let size = u32::from_le_bytes(dat[6..10].try_into().unwrap()) as usize;
+    let aligned = size + 16 - size % 16;
+    let mut plain = zeroize::Zeroizing::new(dat[15..15 + aligned].to_vec());
+    for block in plain.as_chunks_mut::<16>().0 {
+        cipher.decrypt_block(block.into());
+    }
+    let recognized = decoder::detect_image_format(&plain[..16]) != "bin";
+    let pad = *plain.last().unwrap() as usize;
+    if pad == 0
+        || pad > 16
+        || !plain[plain.len() - pad..]
+            .iter()
+            .all(|b| *b as usize == pad)
+    {
+        return if recognized {
+            Err(Failure::Stage(Stage::Pkcs7))
+        } else {
+            Ok(None)
+        };
+    }
+    if plain.len() - pad != size {
+        return Err(Failure::Stage(Stage::AesBody));
+    }
+    if !recognized {
+        return Err(Failure::Stage(Stage::FormatDetect));
+    }
+    plain.truncate(size);
+    let xor_size = u32::from_le_bytes(dat[10..14].try_into().unwrap()) as usize;
+    let raw_end = dat.len() - xor_size;
+    plain.extend_from_slice(&dat[15 + aligned..raw_end]);
+    plain.extend(dat[raw_end..].iter().map(|b| b ^ key.xor));
+    Ok(Some(plain.to_vec()))
 }
 
 #[cfg(windows)]
@@ -345,6 +566,38 @@ fn dpapi(data: &[u8], scope: &str, protect: bool) -> Result<Vec<u8>, Failure> {
     }
 }
 #[cfg(test)]
+fn decode(
+    dat: &[u8],
+    scope: &str,
+    vault: &mut impl Vault,
+    scan: &mut impl FnMut(&[u8]) -> Result<Key, Failure>,
+) -> Result<Vec<u8>, Failure> {
+    struct Adapter<'a, F>(&'a mut F);
+    impl<F: FnMut(&[u8]) -> Result<Key, Failure>> Scanner for Adapter<'_, F> {
+        fn scan(
+            &mut self,
+            dat: &[u8],
+            _: Instant,
+            _: &mut Candidates,
+            accept: &mut dyn FnMut([u8; 16]) -> bool,
+        ) -> Result<(), Failure> {
+            let key = (self.0)(dat)?;
+            accept(key.aes);
+            Ok(())
+        }
+    }
+    attempt(
+        dat,
+        scope,
+        vault,
+        &mut Adapter(scan),
+        Instant::now() + Duration::from_secs(3),
+        &mut Candidates::default(),
+        true,
+    )
+    .map(|(data, _)| data)
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attachment::decoder::V2_MAGIC;
@@ -360,7 +613,11 @@ mod tests {
     }
     fn encrypted(key: &Key) -> Vec<u8> {
         use aes::cipher::{BlockEncrypt, KeyInit};
-        let mut plain = b"\x89PNG\r\n\x1a\nsynthetic".to_vec();
+        let mut image = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut image, image::ImageFormat::Png)
+            .unwrap();
+        let mut plain = image.into_inner();
         let size = plain.len();
         let pad = 16 - size % 16;
         plain.resize(size + pad, pad as u8);
@@ -431,7 +688,7 @@ mod tests {
         dat.extend_from_slice(&[0; 8]);
         assert!(matches!(
             decode(&dat, "a", &mut v, &mut |_| panic!("truncated")),
-            Err(Failure::ResourceIncomplete)
+            Err(Failure::Incomplete(Stage::AesHead))
         ));
         assert!(matches!(
             decode(b"unknown", "a", &mut v, &mut |_| panic!("unknown")),
@@ -533,7 +790,7 @@ mod tests {
             decode(&dat, "a", &mut vault, &mut |_| panic!(
                 "body corruption is not key invalidation"
             )),
-            Err(Failure::DecodeFailed)
+            Err(Failure::Stage(Stage::Pkcs7))
         ));
     }
     #[test]
@@ -564,3 +821,7 @@ mod tests {
         assert!(Dpapi.unprotect(&protected, "synthetic-b").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "harvest_tests.rs"]
+mod harvest_tests;
